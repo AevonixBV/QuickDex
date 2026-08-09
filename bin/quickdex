@@ -1,0 +1,21 @@
+#!/usr/bin/env sh
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Index subcommand: quickdex index [root] [output.db]
+if [ "$1" = "index" ] || [ "$1" = "build" ]; then
+    shift
+    exec php "$SCRIPT_DIR/index.php" "$@"
+fi
+
+# Walk up from CWD to find the nearest quickdex.db
+dir="$(pwd)"
+while [ "$dir" != "/" ]; do
+    if [ -f "$dir/quickdex.db" ]; then
+        QUICKDEX_DB="$dir/quickdex.db"
+        export QUICKDEX_DB
+        break
+    fi
+    dir="$(dirname "$dir")"
+done
+
+exec php "$SCRIPT_DIR/query.php" "$@"
