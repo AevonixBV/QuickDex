@@ -460,6 +460,123 @@ check('grep excludes dist/ build artifacts', count($qe5->grep(['compiled'], [], 
 
 unset($qe5, $indexer5);
 
+// ── Pass 6: Go and Python indexing (isolated fixture) ───────────────────────
+
+$fixtureRoot3 = sys_get_temp_dir().DIRECTORY_SEPARATOR.'quickdex_test3_'.uniqid();
+$dbPath3 = $fixtureRoot3.DIRECTORY_SEPARATOR.'quickdex.db';
+register_shutdown_function(function () use (&$fixtureRoot3) {
+    rrmdir($fixtureRoot3);
+});
+mkdir($fixtureRoot3, 0777, true);
+
+$goFixture = <<<'GO'
+package widget
+
+import (
+	"fmt"
+	"strings"
+)
+
+type GoWidget struct {
+	Name string
+}
+
+func (w *GoWidget) Describe() string {
+	return fmt.Sprintf("Widget: %s", w.Name)
+}
+
+func NewGoWidget(name string) *GoWidget {
+	return &GoWidget{Name: strings.TrimSpace(name)}
+}
+
+type Describer interface {
+	Describe() string
+}
+GO;
+
+$pyFixture = <<<'PY'
+import os
+from collections import OrderedDict
+
+
+class PyWidget:
+    def __init__(self, name):
+        self.name = name
+
+    def render(self):
+        return f"Widget: {self.name}"
+
+
+def build_py_widget(name):
+    return PyWidget(name)
+PY;
+
+writeFixture($fixtureRoot3, 'widget.go', $goFixture);
+writeFixture($fixtureRoot3, 'widget.py', $pyFixture);
+
+$indexer6 = new SourceIndexer($fixtureRoot3, $dbPath3);
+$indexer6->build();
+$qe6 = new QueryEngine($dbPath3);
+
+// Go: struct, receiver method (ns = receiver type), plain function, interface, imports.
+$goStructDefs = $qe6->def('GoWidget');
+check('def finds the GoWidget struct', count($goStructDefs) === 1 && $goStructDefs[0]['kind'] === 'struct',
+    'got '.json_encode($goStructDefs));
+
+$goMethodDefs = $qe6->def('Describe');
+check('def finds the Describe() method with its receiver type as ns',
+    count($goMethodDefs) === 1 && $goMethodDefs[0]['kind'] === 'method' && $goMethodDefs[0]['ns'] === 'GoWidget',
+    'got '.json_encode($goMethodDefs));
+
+$goFuncDefs = $qe6->def('NewGoWidget');
+check('def finds the top-level NewGoWidget function', count($goFuncDefs) === 1 && $goFuncDefs[0]['kind'] === 'function',
+    'got '.json_encode($goFuncDefs));
+
+$goInterfaceDefs = $qe6->def('Describer');
+check('def finds the Describer interface', count($goInterfaceDefs) === 1 && $goInterfaceDefs[0]['kind'] === 'interface',
+    'got '.json_encode($goInterfaceDefs));
+
+$goDescribeBody = $qe6->body('Describe');
+if ($goDescribeBody['matches']) {
+    $src = $goDescribeBody['matches'][0]['source'];
+    check('body(Describe) captures the method body up to its closing brace',
+        str_contains($src, 'fmt.Sprintf') && str_ends_with(rtrim($src), '}'), 'source: '.$src);
+}
+
+$fmtRefs = $qe6->refs('fmt');
+check('refs finds the grouped-import "fmt" package used in widget.go', count($fmtRefs) > 0, 'got '.json_encode($fmtRefs));
+
+// Python: class, method (ns = owning class), top-level function, imports.
+$pyClassDefs = $qe6->def('PyWidget');
+check('def finds the PyWidget class', count($pyClassDefs) === 1 && $pyClassDefs[0]['kind'] === 'class',
+    'got '.json_encode($pyClassDefs));
+
+$pyMethodDefs = $qe6->def('render');
+check('def finds the render() method with its owning class as ns',
+    count($pyMethodDefs) === 1 && $pyMethodDefs[0]['kind'] === 'method' && $pyMethodDefs[0]['ns'] === 'PyWidget',
+    'got '.json_encode($pyMethodDefs));
+
+$pyFuncDefs = $qe6->def('build_py_widget');
+check('def finds the top-level build_py_widget function', count($pyFuncDefs) === 1 && $pyFuncDefs[0]['kind'] === 'function',
+    'got '.json_encode($pyFuncDefs));
+
+$pyRenderBody = $qe6->body('render');
+if ($pyRenderBody['matches']) {
+    $src = $pyRenderBody['matches'][0]['source'];
+    checkEquals('body(render) captures exactly the method (indentation-delimited, not the whole class)',
+        "    def render(self):\n        return f\"Widget: {self.name}\"",
+        $src
+    );
+}
+
+$orderedDictRefs = $qe6->refs('OrderedDict');
+check('refs finds the "from collections import OrderedDict" name', count($orderedDictRefs) > 0, 'got '.json_encode($orderedDictRefs));
+
+$collectionsRefs = $qe6->refs('collections');
+check('refs finds the "from collections import ..." module', count($collectionsRefs) > 0, 'got '.json_encode($collectionsRefs));
+
+unset($qe6, $indexer6);
+
 // ── Report ───────────────────────────────────────────────────────────────────
 
 echo "\n".str_repeat('─', 60)."\n";

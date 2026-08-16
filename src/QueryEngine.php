@@ -260,7 +260,7 @@ final class QueryEngine
      *                                  which crashes the .bat wrapper on Windows anyway (`|` and
      *                                  `()` are cmd.exe metacharacters — see grep case in query.php).
      */
-    public function grep(array $patterns, array $dirs = [], array $extensions = ['php', 'vue', 'js', 'ts', 'blade', 'yml', 'yaml'], int $limit = 200, bool $filesOnly = false, bool $includeNoisy = false): array
+    public function grep(array $patterns, array $dirs = [], array $extensions = ['php', 'vue', 'js', 'ts', 'blade', 'yml', 'yaml', 'go', 'py'], int $limit = 200, bool $filesOnly = false, bool $includeNoisy = false): array
     {
         $root = $this->rootPath();
         $searchRoots = $dirs === []
@@ -285,8 +285,34 @@ final class QueryEngine
                 continue; // caller (query.php) validates & reports invalid --dir
             }
 
+            // Prune excluded directories BEFORE recursing into them, mirroring
+            // SourceIndexer::collectFiles() — a plain RecursiveDirectoryIterator
+            // enumerates every file inside vendor/node_modules/.git only to
+            // discard each one afterwards, which made a root-wide grep (no --dir)
+            // take minutes on Windows instead of seconds.
+            $excluded = function (string $path) use ($root, $excludedSegments, $excludedCompound): bool {
+                $rel = str_starts_with($path, $root.DIRECTORY_SEPARATOR) ? substr($path, strlen($root) + 1) : $path;
+                $rel = str_replace('\\', '/', $rel);
+
+                foreach (explode('/', $rel) as $segment) {
+                    if (in_array($segment, $excludedSegments, true)) {
+                        return true;
+                    }
+                }
+                foreach ($excludedCompound as $compound) {
+                    if ($rel === $compound || str_starts_with($rel, $compound.'/')) {
+                        return true;
+                    }
+                }
+
+                return false;
+            };
+
             $iterator = new \RecursiveIteratorIterator(
-                new \RecursiveDirectoryIterator($searchRoot, \FilesystemIterator::SKIP_DOTS),
+                new \RecursiveCallbackFilterIterator(
+                    new \RecursiveDirectoryIterator($searchRoot, \FilesystemIterator::SKIP_DOTS),
+                    fn (\SplFileInfo $current): bool => ! $excluded($current->getPathname()),
+                ),
                 \RecursiveIteratorIterator::LEAVES_ONLY,
             );
 
@@ -298,26 +324,6 @@ final class QueryEngine
                 $path = $item->getPathname();
                 $rel = str_starts_with($path, $root.DIRECTORY_SEPARATOR) ? substr($path, strlen($root) + 1) : $path;
                 $rel = str_replace('\\', '/', $rel);
-
-                $segments = explode('/', $rel);
-                $skip = false;
-                foreach ($segments as $segment) {
-                    if (in_array($segment, $excludedSegments, true)) {
-                        $skip = true;
-                        break;
-                    }
-                }
-                if (! $skip) {
-                    foreach ($excludedCompound as $compound) {
-                        if (str_starts_with($rel, $compound.'/')) {
-                            $skip = true;
-                            break;
-                        }
-                    }
-                }
-                if ($skip) {
-                    continue;
-                }
 
                 $base = basename($path);
                 if (! $includeNoisy && (in_array($base, $noisyFiles, true) || str_contains($base, '.min.'))) {

@@ -1,6 +1,6 @@
 # QuickDex
 
-Fast symbol index for PHP/Vue/TypeScript/JavaScript codebases. Builds a SQLite database from your source files so you can look up where any class, function, component, or type is defined — and what files use it — without reading file contents.
+Fast symbol index for PHP/Vue/TypeScript/JavaScript/Go/Python codebases. Builds a SQLite database from your source files so you can look up where any class, function, component, or type is defined — and what files use it — without reading file contents.
 
 Designed for use with AI coding agents (Claude Code) to reduce token usage and speed up codebase navigation.
 
@@ -179,19 +179,19 @@ QUICKDEX_DB=/path/to/quickdex.db quickdex def User
 
 ## What gets indexed
 
-| Symbol type | PHP | Vue | JS/TS | Blade |
-|---|---|---|---|---|
-| Classes | yes | yes | yes | — |
-| Interfaces | yes | yes | yes | — |
-| Traits | yes | — | — | — |
-| Methods | yes (`kind=method`, `ns=owning class`) | — | — | — |
-| Functions | top-level only | yes | top-level (incl. arrow-function consts) | — |
-| Constants | `const UPPER` | — | exported `const` only | — |
-| Types | — | — | exported `type` | — |
-| Exports | — | yes | yes | — |
-| Sections | — | — | — | `@section(...)` |
-| Imports / refs | `use` statements **+ inline usages** (`new X`, `X::`, `extends`/`implements`, type hints — incl. same-namespace siblings, via the native tokenizer so comments/strings are skipped) | `import` | `import` | `@include`/`@extends`/`@component`/`<x-component>` |
-| Class hierarchy | extends + implements + traits | — | — | — |
+| Symbol type | PHP | Vue | JS/TS | Blade | Go | Python |
+|---|---|---|---|---|---|---|
+| Classes | yes | yes | yes | — | — | yes |
+| Structs / Interfaces | yes (interfaces) | yes (interfaces) | yes (interfaces) | — | yes (structs + interfaces) | — |
+| Traits | yes | — | — | — | — | — |
+| Methods | yes (`kind=method`, `ns=owning class`) | — | — | — | yes (`kind=method`, `ns=receiver type`) | yes (`kind=method`, `ns=owning class`) |
+| Functions | top-level only | yes | top-level (incl. arrow-function consts) | — | yes | yes (incl. `async def`) |
+| Constants | `const UPPER` | — | exported `const` only | — | — | — |
+| Types | — | — | exported `type` | — | — | — |
+| Exports | — | yes | yes | — | — | — |
+| Sections | — | — | — | `@section(...)` | — | — |
+| Imports / refs | `use` statements **+ inline usages** (`new X`, `X::`, `extends`/`implements`, type hints — incl. same-namespace siblings, via the native tokenizer so comments/strings are skipped) | `import` | `import` | `@include`/`@extends`/`@component`/`<x-component>` | `import` (single-line + grouped block) | `import` / `from ... import ...` |
+| Class hierarchy | extends + implements + traits | — | — | — | — | — |
 | Migrations | `Schema::create/table/dropIfExists/drop` indexed as `kind=table:<op>`, `name=<table>` — `def <table>` finds every migration touching it | — | — | — |
 
 JS/TS indexing intentionally skips inner-scope variables — only exported and top-level symbols are indexed to avoid noise. `.blade.php` files are indexed as `type=blade` — `refs x-email.layout` finds every view using that component.

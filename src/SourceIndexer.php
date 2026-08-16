@@ -42,7 +42,7 @@ final class SourceIndexer
         'public/build',
     ];
 
-    private array $extensions = ['php', 'inc', 'vue', 'js', 'ts'];
+    private array $extensions = ['php', 'inc', 'vue', 'js', 'ts', 'go', 'py'];
 
     public function __construct(string $root, string $dbPath)
     {
@@ -249,25 +249,34 @@ final class SourceIndexer
         return $db;
     }
 
+    /**
+     * Prunes excluded directories (vendor, node_modules, .git, ...) BEFORE recursing
+     * into them, via RecursiveCallbackFilterIterator — a plain RecursiveDirectoryIterator
+     * would walk every file inside a huge vendor/node_modules tree only to discard them
+     * one by one in isExcluded(), which is what made (re)indexing large repos slow even
+     * when the incremental pass had nothing new to parse.
+     */
     private function collectFiles(): \Generator
     {
-        $iterator = new \RecursiveIteratorIterator(
+        $filtered = new \RecursiveCallbackFilterIterator(
             new \RecursiveDirectoryIterator($this->root, \FilesystemIterator::SKIP_DOTS),
-            \RecursiveIteratorIterator::LEAVES_ONLY,
+            function (\SplFileInfo $current, mixed $key, \RecursiveDirectoryIterator $iterator): bool {
+                $rel = $this->relativePath($current->getPathname());
+
+                if ($iterator->hasChildren()) {
+                    return ! $this->isExcluded($rel);
+                }
+
+                return ! $this->isExcluded($rel) && $this->shouldIndex($rel);
+            },
         );
 
+        $iterator = new \RecursiveIteratorIterator($filtered, \RecursiveIteratorIterator::LEAVES_ONLY);
+
         foreach ($iterator as $item) {
-            if (! $item->isFile()) {
-                continue;
+            if ($item->isFile()) {
+                yield $item->getPathname();
             }
-
-            $rel = $this->relativePath($item->getPathname());
-
-            if ($this->isExcluded($rel) || ! $this->shouldIndex($rel)) {
-                continue;
-            }
-
-            yield $item->getPathname();
         }
     }
 
@@ -287,6 +296,8 @@ final class SourceIndexer
             $isBlade          => $this->parseBlade($content),
             $ext === 'vue'    => $this->parseVue($content),
             $ext === 'js', $ext === 'ts' => $this->parseScript($content, $ext),
+            $ext === 'go'     => $this->parseGo($content),
+            $ext === 'py'     => $this->parsePython($content),
             default           => $this->parsePhp($content),
         };
 
@@ -615,6 +626,283 @@ final class SourceIndexer
         }
 
         return $refs;
+    }
+
+    // ── Go ───────────────────────────────────────────────────────────────────
+
+    private function parseGo(string $content): array
+    {
+        $ns = null;
+        if (preg_match('/^package\s+([A-Za-z_][A-Za-z0-9_]*)/m', $content, $m)) {
+            $ns = trim($m[1]);
+        }
+
+        $defs = [];
+        $refs = [];
+        $counts = [];
+
+        // Methods: func (recv Type) Name(...) / func (recv *Type) Name(...) — ns
+        // records the receiver type so `syms`/`def` group methods with their type,
+        // mirroring how PHP methods record their owning class.
+        if (preg_match_all(
+            '/^func\s+\(\s*[A-Za-z_][A-Za-z0-9_]*\s+\*?([A-Za-z_][A-Za-z0-9_]*)\s*\)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/m',
+            $content, $m, PREG_OFFSET_CAPTURE
+        )) {
+            foreach ($m[2] as $i => $match) {
+                $name = trim($match[0]);
+                $receiver = trim($m[1][$i][0]);
+                $offset = $match[1];
+                $endOffset = $this->findDeclarationEnd($content, $offset + strlen($name));
+                $defs[] = [
+                    'name' => $name,
+                    'kind' => 'method',
+                    'line' => $this->lineAt($content, $offset),
+                    'end_line' => $this->lineAt($content, $endOffset),
+                    'ns' => $receiver,
+                ];
+            }
+            $counts['methods'] = count($m[2]);
+        }
+
+        // Plain (non-method) functions: func Name(...)
+        if (preg_match_all('/^func\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/m', $content, $m, PREG_OFFSET_CAPTURE)) {
+            foreach ($m[1] as $match) {
+                $name = trim($match[0]);
+                $offset = $match[1];
+                $endOffset = $this->findDeclarationEnd($content, $offset + strlen($name));
+                $defs[] = [
+                    'name' => $name,
+                    'kind' => 'function',
+                    'line' => $this->lineAt($content, $offset),
+                    'end_line' => $this->lineAt($content, $endOffset),
+                    'ns' => $ns,
+                ];
+            }
+            $counts['functions'] = count($m[1]);
+        }
+
+        // Structs
+        if (preg_match_all('/^type\s+([A-Za-z_][A-Za-z0-9_]*)\s+struct\b/m', $content, $m, PREG_OFFSET_CAPTURE)) {
+            foreach ($m[1] as $match) {
+                $name = trim($match[0]);
+                $offset = $match[1];
+                $endOffset = $this->findDeclarationEnd($content, $offset + strlen($name));
+                $defs[] = [
+                    'name' => $name,
+                    'kind' => 'struct',
+                    'line' => $this->lineAt($content, $offset),
+                    'end_line' => $this->lineAt($content, $endOffset),
+                    'ns' => $ns,
+                ];
+            }
+            $counts['structs'] = count($m[1]);
+        }
+
+        // Interfaces
+        if (preg_match_all('/^type\s+([A-Za-z_][A-Za-z0-9_]*)\s+interface\b/m', $content, $m, PREG_OFFSET_CAPTURE)) {
+            foreach ($m[1] as $match) {
+                $name = trim($match[0]);
+                $offset = $match[1];
+                $endOffset = $this->findDeclarationEnd($content, $offset + strlen($name));
+                $defs[] = [
+                    'name' => $name,
+                    'kind' => 'interface',
+                    'line' => $this->lineAt($content, $offset),
+                    'end_line' => $this->lineAt($content, $endOffset),
+                    'ns' => $ns,
+                ];
+            }
+            $counts['interfaces'] = count($m[1]);
+        }
+
+        // Imports (grouped `import (...)` block) → refs, full path + last segment
+        if (preg_match('/^import\s*\(([\s\S]*?)\n\)/m', $content, $m, PREG_OFFSET_CAPTURE)) {
+            $block = $m[1][0];
+            $blockOffset = $m[1][1];
+            if (preg_match_all('/^\s*(?:[A-Za-z_][A-Za-z0-9_]*\s+)?"([^"]+)"/m', $block, $im, PREG_OFFSET_CAPTURE)) {
+                foreach ($im[1] as $match) {
+                    $path = $match[0];
+                    $line = $this->lineAt($content, $match[1] + $blockOffset);
+                    $refs[] = ['symbol' => $path, 'line' => $line];
+                    $parts = explode('/', $path);
+                    $short = end($parts);
+                    if ($short !== $path) {
+                        $refs[] = ['symbol' => $short, 'line' => $line];
+                    }
+                }
+            }
+        }
+
+        // Imports (single-line `import "path"`) → refs
+        if (preg_match_all('/^import\s+"([^"]+)"/m', $content, $m, PREG_OFFSET_CAPTURE)) {
+            foreach ($m[1] as $match) {
+                $path = $match[0];
+                $line = $this->lineAt($content, $match[1]);
+                $refs[] = ['symbol' => $path, 'line' => $line];
+                $parts = explode('/', $path);
+                $short = end($parts);
+                if ($short !== $path) {
+                    $refs[] = ['symbol' => $short, 'line' => $line];
+                }
+            }
+        }
+
+        $lines = substr_count($content, "\n") + 1;
+        $summary = $this->buildSummary($counts, $lines);
+
+        return [
+            'type'      => 'go',
+            'ns'        => $ns,
+            'defs'      => $defs,
+            'refs'      => $refs,
+            'hierarchy' => [],
+            'summary'   => $summary,
+        ];
+    }
+
+    // ── Python ───────────────────────────────────────────────────────────────
+
+    private function parsePython(string $content): array
+    {
+        $lines = explode("\n", str_replace("\r\n", "\n", $content));
+        $lineCount = count($lines);
+
+        $defs = [];
+        $refs = [];
+        $counts = [];
+        $classRanges = [];
+
+        // Classes — indentation-delimited body, so its extent is found by scanning
+        // forward for the next line whose indentation falls back to <= the class's
+        // own (mirrors findDeclarationEnd's brace-matching role for brace languages).
+        foreach ($lines as $i => $line) {
+            if (preg_match('/^(\s*)class\s+([A-Za-z_][A-Za-z0-9_]*)/', $line, $m)) {
+                $indent = strlen($m[1]);
+                $name = $m[2];
+                $lineNo = $i + 1;
+                $endLineNo = $this->findPythonBlockEnd($lines, $i, $indent);
+                $defs[] = [
+                    'name' => $name,
+                    'kind' => 'class',
+                    'line' => $lineNo,
+                    'end_line' => $endLineNo,
+                    'ns' => null,
+                ];
+                $classRanges[] = ['name' => $name, 'start' => $lineNo, 'end' => $endLineNo];
+            }
+        }
+        $counts['classes'] = count($classRanges);
+
+        // Functions and methods — an indented `def` inside a class's line range is a
+        // method (ns = owning class), everything else is a top-level function.
+        $funcCount = 0;
+        foreach ($lines as $i => $line) {
+            if (preg_match('/^(\s*)(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/', $line, $m)) {
+                $indent = strlen($m[1]);
+                $name = $m[2];
+                $lineNo = $i + 1;
+                $endLineNo = $this->findPythonBlockEnd($lines, $i, $indent);
+                $owner = $indent > 0 ? $this->findOwnerClassByLine($classRanges, $lineNo) : null;
+                $defs[] = [
+                    'name' => $name,
+                    'kind' => $owner !== null ? 'method' : 'function',
+                    'line' => $lineNo,
+                    'end_line' => $endLineNo,
+                    'ns' => $owner,
+                ];
+                $funcCount++;
+            }
+        }
+        $counts['functions'] = $funcCount;
+
+        // Imports → refs: `import x.y as z`, `import x, y`, `from x.y import a, b as c`
+        foreach ($lines as $i => $line) {
+            $lineNo = $i + 1;
+
+            if (preg_match('/^\s*from\s+(\.*[A-Za-z0-9_.]*)\s+import\s+(.+)$/', $line, $m)) {
+                $module = trim($m[1]);
+                if ($module !== '') {
+                    $refs[] = ['symbol' => $module, 'line' => $lineNo];
+                }
+                $importList = trim(trim($m[2]), '()');
+                foreach (explode(',', $importList) as $part) {
+                    $part = trim(preg_replace('/\s+as\s+\S+$/', '', trim($part)));
+                    if ($part !== '' && $part !== '*') {
+                        $refs[] = ['symbol' => $part, 'line' => $lineNo];
+                    }
+                }
+            } elseif (preg_match('/^\s*import\s+(.+)$/', $line, $m)) {
+                foreach (explode(',', $m[1]) as $part) {
+                    $part = trim(preg_replace('/\s+as\s+\S+$/', '', trim($part)));
+                    if ($part === '') {
+                        continue;
+                    }
+                    $refs[] = ['symbol' => $part, 'line' => $lineNo];
+                    $parts = explode('.', $part);
+                    $short = end($parts);
+                    if ($short !== $part) {
+                        $refs[] = ['symbol' => $short, 'line' => $lineNo];
+                    }
+                }
+            }
+        }
+
+        $summary = $this->buildSummary($counts, $lineCount);
+
+        return [
+            'type'      => 'py',
+            'ns'        => null,
+            'defs'      => $defs,
+            'refs'      => $refs,
+            'hierarchy' => [],
+            'summary'   => $summary,
+        ];
+    }
+
+    /**
+     * Line number (1-indexed) of the last non-blank line still inside the
+     * indentation-delimited block that opens at $lines[$startIndex] — i.e. the
+     * last line before indentation returns to <= $indent. Blank lines don't end
+     * a block on their own (a blank line inside a function body is common); only
+     * a following line of code at or below the opening indent does.
+     */
+    private function findPythonBlockEnd(array $lines, int $startIndex, int $indent): int
+    {
+        $count = count($lines);
+        $lastContentLine = $startIndex + 1;
+
+        for ($i = $startIndex + 1; $i < $count; $i++) {
+            $line = $lines[$i];
+            if (trim($line) === '') {
+                continue;
+            }
+            $lineIndent = strlen($line) - strlen(ltrim($line, " \t"));
+            if ($lineIndent <= $indent) {
+                return $lastContentLine;
+            }
+            $lastContentLine = $i + 1;
+        }
+
+        return $lastContentLine;
+    }
+
+    /** Innermost class (by line range) containing $lineNo, if any — Python's line-number analog of findOwnerClass(). */
+    private function findOwnerClassByLine(array $ranges, int $lineNo): ?string
+    {
+        $best = null;
+        $bestSize = PHP_INT_MAX;
+
+        foreach ($ranges as $range) {
+            if ($lineNo > $range['start'] && $lineNo <= $range['end']) {
+                $size = $range['end'] - $range['start'];
+                if ($size < $bestSize) {
+                    $bestSize = $size;
+                    $best = $range['name'];
+                }
+            }
+        }
+
+        return $best;
     }
 
     /** Framework-generated code path (Laravel Wayfinder output) — flagged, not excluded. */
@@ -1021,6 +1309,7 @@ final class SourceIndexer
     {
         $labels = [
             'classes'    => 'class(es)',
+            'structs'    => 'struct(s)',
             'interfaces' => 'interface(s)',
             'traits'     => 'trait(s)',
             'functions'  => 'function(s)',

@@ -108,9 +108,15 @@ function table(array $rows, array $cols): void
 }
 
 /**
- * Called when a query returned no rows. Checks if the index is stale (>5 min old):
+ * Called when a query returned no rows. Checks if the index is stale (default
+ * >30 min old, override via QUICKDEX_STALE_SECONDS):
  * - Stale: rebuilds incrementally, re-runs $runQuery on a fresh engine, returns results.
  * - Current: prints a hint and returns null — caller must skip any further output.
+ *
+ * The rebuild is guarded by a file lock so parallel invocations hitting the same
+ * stale DB at once (e.g. an agent firing several quickdex calls in one batch)
+ * don't each pay for a duplicate full directory walk — the second call blocks,
+ * then sees the DB freshly rebuilt by the first and skips straight to the query.
  */
 function autoRefreshQuery(string $dbPath, callable $runQuery): ?array
 {
@@ -118,18 +124,35 @@ function autoRefreshQuery(string $dbPath, callable $runQuery): ?array
         return null;
     }
 
-    if ((time() - (int) filemtime($dbPath)) > 300) {
-        $root = '';
-        try {
-            $raw  = new \PDO('sqlite:'.$dbPath);
-            $stmt = $raw->query("SELECT value FROM meta WHERE key = 'root'");
-            $root = $stmt ? (string) $stmt->fetchColumn() : '';
-        } catch (\Throwable) {
+    $staleSeconds = (int) (getenv('QUICKDEX_STALE_SECONDS') ?: 1800);
+
+    if ((time() - (int) filemtime($dbPath)) > $staleSeconds) {
+        $lock = fopen($dbPath.'.lock', 'c');
+
+        if ($lock !== false && flock($lock, LOCK_EX)) {
+            clearstatcache(true, $dbPath);
+
+            if ((time() - (int) filemtime($dbPath)) > $staleSeconds) {
+                $root = '';
+                try {
+                    $raw  = new \PDO('sqlite:'.$dbPath);
+                    $stmt = $raw->query("SELECT value FROM meta WHERE key = 'root'");
+                    $root = $stmt ? (string) $stmt->fetchColumn() : '';
+                } catch (\Throwable) {
+                }
+
+                if ($root !== '' && is_dir($root)) {
+                    require_once __DIR__.'/../src/SourceIndexer.php';
+                    (new \QuickDex\SourceIndexer($root, $dbPath))->build();
+                }
+            }
+
+            flock($lock, LOCK_UN);
+            fclose($lock);
         }
 
-        if ($root !== '' && is_dir($root)) {
-            require_once __DIR__.'/../src/SourceIndexer.php';
-            (new \QuickDex\SourceIndexer($root, $dbPath))->build();
+        clearstatcache(true, $dbPath);
+        if ((time() - (int) filemtime($dbPath)) <= $staleSeconds) {
             echo "(index was stale — refreshed)\n";
 
             return $runQuery(new \QuickDex\QueryEngine($dbPath));
@@ -162,7 +185,7 @@ function markGenerated(array $rows): array
 
 if ($command === 'help' || $command === '--help' || $command === '-h') {
     echo <<<'HELP'
-    QuickDex — fast symbol index for PHP/Vue/TS/JS codebases
+    QuickDex — fast symbol index for PHP/Vue/TS/JS/Go/Python codebases
 
     Commands:
       def      <name>                  Where is a symbol defined
@@ -171,7 +194,7 @@ if ($command === 'help' || $command === '--help' || $command === '-h') {
                                         needed for the common case). Capped at 10 matches
                                         and 400 lines per match by default.
       refs     <symbol>                Files+lines that reference a symbol or import path
-      files    [--type php|vue|ts|js]  List files (optional filters)
+      files    [--type php|vue|ts|js|go|py]  List files (optional filters)
                [--ns Namespace\Prefix]
                [--path path/prefix]
       hier     <class>                 Class hierarchy (extends/implements/traits)
@@ -193,7 +216,8 @@ if ($command === 'help' || $command === '--help' || $command === '-h') {
       def/body/search strip namespace prefixes — "App\Models\User" is treated as "User"
       refs falls back to suffix matching — "pages/Calendar" matches "@/pages/Calendar" imports
       files --path filters by path prefix (complements --ns which is PHP-namespace-only)
-      On empty results quickdex checks staleness (>5 min) and auto-refreshes the index if so
+      On empty results quickdex checks staleness (>30 min, or $QUICKDEX_STALE_SECONDS)
+        and auto-refreshes the index if so
       def/syms/search index class methods (kind=method, ns=owning class)
         and JS/TS/Vue arrow-function consts
       Blade files: @include/@extends/<x-component> become refs; @section() becomes a def
@@ -203,7 +227,8 @@ if ($command === 'help' || $command === '--help' || $command === '-h') {
         pass --force for a full rebuild
 
     Environment:
-      QUICKDEX_DB   Path to database (default: ./quickdex.db)
+      QUICKDEX_DB             Path to database (default: ./quickdex.db)
+      QUICKDEX_STALE_SECONDS  Auto-refresh threshold on empty results (default: 1800)
 
     Examples:
       quickdex def HourEntry
@@ -497,7 +522,7 @@ try {
             $limit     = max(1, (int) (arg($args, 0, '--limit') ?? 200));
             $filesOnly = in_array('--files-only', $args, true) || in_array('-l', $args, true);
             $allFiles  = in_array('--all', $args, true);
-            $exts      = $extArg !== '' ? array_map('trim', explode(',', $extArg)) : ['php', 'vue', 'js', 'ts', 'blade', 'yml', 'yaml'];
+            $exts      = $extArg !== '' ? array_map('trim', explode(',', $extArg)) : ['php', 'vue', 'js', 'ts', 'blade', 'yml', 'yaml', 'go', 'py'];
             if ($patterns === []) {
                 echo "Usage: quickdex grep <pattern1> [pattern2 ...] [--dir a,b] [--ext php,vue,blade,...] [--limit N] [-l|--files-only] [--all]\n";
                 echo "Multiple patterns match with OR semantics — use separate args, not '|' (crashes the Windows .bat wrapper; also grep never supported regex).\n";
