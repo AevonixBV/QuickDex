@@ -577,6 +577,243 @@ check('refs finds the "from collections import ..." module', count($collectionsR
 
 unset($qe6, $indexer6);
 
+// ── Laravel layer (schema 3.0): routes, Inertia pages, Vue template/props/emits, Ziggy ──
+//
+// A fixture `artisan` script stands in for the framework: `php artisan route:list --json`
+// prints a canned route list, exactly the shape Laravel emits, so the route table
+// path is exercised end to end without booting an app.
+
+$laravelRoot = sys_get_temp_dir().DIRECTORY_SEPARATOR.'quickdex_laravel_'.uniqid();
+$laravelDb = $laravelRoot.DIRECTORY_SEPARATOR.'quickdex.db';
+register_shutdown_function(function () use (&$laravelRoot) {
+    rrmdir($laravelRoot);
+});
+mkdir($laravelRoot, 0777, true);
+
+writeFixture($laravelRoot, 'artisan', <<<'PHP'
+<?php
+if (($argv[1] ?? '') === 'route:list') {
+    echo json_encode([
+        ['domain' => null, 'method' => 'GET|HEAD', 'uri' => 'sites', 'name' => 'sites.index', 'action' => 'App\Http\Controllers\SiteController@index', 'middleware' => ['web', 'Illuminate\Auth\Middleware\Authenticate'], 'path' => null],
+        ['domain' => null, 'method' => 'GET|HEAD', 'uri' => 'features', 'name' => 'features.show', 'action' => 'App\Http\Controllers\FeaturesController', 'middleware' => ['web'], 'path' => null],
+        ['domain' => null, 'method' => 'GET|HEAD', 'uri' => 'about', 'name' => 'about.show', 'action' => 'Closure', 'middleware' => ['web'], 'path' => 'routes/web.php:3'],
+        ['domain' => null, 'method' => 'GET|HEAD', 'uri' => 'admin/users', 'name' => 'admin.users.index', 'action' => 'App\Http\Controllers\Admin\UserController@index', 'middleware' => ['web', 'Illuminate\Auth\Middleware\Authenticate:admin'], 'path' => null],
+    ]);
+    exit(0);
+}
+exit(1);
+PHP);
+
+writeFixture($laravelRoot, 'config/ziggy.php', <<<'PHP'
+<?php
+return ['groups' => ['guest' => ['features.show', 'about.show', 'register'], 'authenticated' => ['sites.*'], 'admin' => ['admin.*']]];
+PHP);
+
+writeFixture($laravelRoot, 'routes/web.php', <<<'PHP'
+<?php
+use Inertia\Inertia;
+Route::get('/about', function () {
+    return Inertia::render('About');
+})->name('about.show');
+PHP);
+
+writeFixture($laravelRoot, 'app/Http/Controllers/SiteController.php', <<<'PHP'
+<?php
+namespace App\Http\Controllers;
+
+use Inertia\Inertia;
+
+class SiteController extends Controller
+{
+    public function index()
+    {
+        return Inertia::render('Sites/Index', ['sites' => []]);
+    }
+
+    public function show()
+    {
+        return redirect()->route('sites.index');
+    }
+}
+PHP);
+
+writeFixture($laravelRoot, 'app/Http/Controllers/FeaturesController.php', <<<'PHP'
+<?php
+namespace App\Http\Controllers;
+
+use Inertia\Inertia;
+
+class FeaturesController extends Controller
+{
+    public function __invoke()
+    {
+        return Inertia::render('Features');
+    }
+}
+PHP);
+
+writeFixture($laravelRoot, 'app/Http/Controllers/Admin/UserController.php', <<<'PHP'
+<?php
+namespace App\Http\Controllers\Admin;
+
+use Inertia\Inertia;
+
+class UserController
+{
+    public function index()
+    {
+        return Inertia::render('Admin/Users/Index');
+    }
+}
+PHP);
+
+writeFixture($laravelRoot, 'resources/js/Pages/Features.vue', <<<'VUE'
+<script setup lang="ts">
+import { computed } from 'vue'
+import StatTile from '@/Components/StatTile.vue'
+import FrontLayout from '@/Layouts/FrontLayout.vue'
+
+const isAuthed = computed(() => !!usePage().props.auth.user)
+</script>
+
+<template>
+    <FrontLayout>
+        <StatTile label="Sites" :href="isAuthed ? route('sites.index') : route('register')" />
+        <a :href="route('features.show')">Features</a>
+        <a :href="route('admin.users.index')">Admin</a>
+        <app-button>Go</app-button>
+    </FrontLayout>
+</template>
+VUE);
+
+writeFixture($laravelRoot, 'resources/js/Pages/Sites/Index.vue', <<<'VUE'
+<script setup>
+const props = defineProps({ sites: Array, total: { type: Number, default: 0 } })
+</script>
+<template><div>{{ props.total }}</div></template>
+VUE);
+
+writeFixture($laravelRoot, 'resources/js/Components/StatTile.vue', <<<'VUE'
+<script setup lang="ts">
+interface Props {
+    label: string
+    href?: string
+    tone?: 'neutral' | 'warn'
+    meta?: { a: string; b: number }
+}
+withDefaults(defineProps<Props>(), { tone: 'neutral' })
+const emit = defineEmits<{
+    (e: 'select', id: number): void
+    (e: 'close'): void
+}>()
+</script>
+<template><button @click="emit('select', 1)">{{ label }}</button></template>
+VUE);
+
+writeFixture($laravelRoot, 'tests/Unit/SiteControllerTest.php', <<<'PHP'
+<?php
+namespace Tests\Unit;
+
+use App\Http\Controllers\SiteController;
+
+class SiteControllerTest extends TestCase {}
+PHP);
+
+writeFixture($laravelRoot, 'tests/Feature/SitesPageTest.php', <<<'PHP'
+<?php
+namespace Tests\Feature;
+
+class SitesPageTest extends TestCase
+{
+    public function test_it_lists(): void
+    {
+        $this->get(route('sites.index'))->assertOk();
+    }
+}
+PHP);
+
+$indexer6 = new SourceIndexer($laravelRoot, $laravelDb);
+$indexer6->build(true);
+$qe6 = new QueryEngine($laravelDb);
+
+check('indexer left no notes for a bootable fixture app', $indexer6->notes === [], implode(' | ', $indexer6->notes));
+check('route table filled from artisan route:list', $qe6->hasRoutes() && count($qe6->routes()) === 4, 'got '.count($qe6->routes()));
+
+$sitesRoute = $qe6->routes('sites.index')[0] ?? null;
+check('route resolves controller@action to file:line via defs',
+    $sitesRoute !== null && $sitesRoute['file'] === 'app/Http/Controllers/SiteController.php' && $sitesRoute['line'] === 8,
+    json_encode($sitesRoute));
+checkEquals('route knows the Inertia page its action renders', 'Sites/Index', $sitesRoute['page'] ?? null);
+checkEquals('route carries its Ziggy group (wildcard pattern sites.*)', 'authenticated', $sitesRoute['ziggy'] ?? null);
+
+$featuresRoute = $qe6->routes('features.show')[0] ?? null;
+check('invokable controller maps to __invoke', ($featuresRoute['action_name'] ?? null) === '__invoke' && ($featuresRoute['page'] ?? null) === 'Features', json_encode($featuresRoute));
+
+$aboutRoute = $qe6->routes('about.show')[0] ?? null;
+check('closure route resolves to routes/web.php:line and its render call', ($aboutRoute['file'] ?? null) === 'routes/web.php' && ($aboutRoute['line'] ?? null) === 3 && ($aboutRoute['page'] ?? null) === 'About', json_encode($aboutRoute));
+
+check('route() string literals are refs (PHP and Vue callers)',
+    count(array_filter($qe6->refs('sites.index'), static fn (array $r): bool => str_ends_with($r['file'], 'SiteController.php'))) === 1
+    && count(array_filter($qe6->refs('sites.index'), static fn (array $r): bool => str_ends_with($r['file'], 'Features.vue'))) === 1
+    && count(array_filter($qe6->refs('sites.index'), static fn (array $r): bool => str_ends_with($r['file'], 'SitesPageTest.php'))) === 1,
+    json_encode($qe6->refs('sites.index')));
+
+$featuresPage = $qe6->page('Features');
+checkEquals('page finds its Vue file', 'resources/js/Pages/Features.vue', $featuresPage['vue_file']);
+checkEquals('page audience from a web-only route is guest', ['guest'], $featuresPage['audience']);
+check('page lists the controller that renders it', count($featuresPage['renders']) === 1 && $featuresPage['renders'][0]['owner'] === 'FeaturesController@__invoke', json_encode($featuresPage['renders']));
+check('page lists template components incl. kebab-case tags as PascalCase',
+    in_array('StatTile', $featuresPage['components'], true) && in_array('AppButton', $featuresPage['components'], true) && in_array('FrontLayout', $featuresPage['components'], true),
+    json_encode($featuresPage['components']));
+$adminCall = array_values(array_filter($featuresPage['route_calls'], static fn (array $c): bool => $c['name'] === 'admin.users.index'))[0] ?? null;
+check('page flags an admin route called from a guest page', $adminCall !== null && $adminCall['ziggy'] === 'admin' && $adminCall['guard'] === 'none', json_encode($adminCall));
+$sitesCall = array_values(array_filter($featuresPage['route_calls'], static fn (array $c): bool => $c['name'] === 'sites.index'))[0] ?? null;
+check('page recognises an isAuthed ternary as a guard', $sitesCall !== null && $sitesCall['guard'] === 'guarded', json_encode($sitesCall));
+
+check('page accepts a Vue path too', $qe6->page('resources/js/Pages/Sites/Index.vue')['routes'][0]['name'] === 'sites.index');
+
+$z = $qe6->ziggyCheck();
+check('ziggy-check reports exactly the unguarded cross-audience call',
+    count($z['violations']) === 1 && $z['violations'][0]['route'] === 'admin.users.index' && $z['guarded'] === 1,
+    json_encode($z));
+
+$tileSyms = $qe6->fileSymbols('resources/js/Components/StatTile.vue');
+$props = array_column(array_filter($tileSyms, static fn (array $s): bool => $s['kind'] === 'prop'), 'name');
+$emits = array_column(array_filter($tileSyms, static fn (array $s): bool => $s['kind'] === 'emit'), 'name');
+checkEquals('defineProps<Props>() via interface yields top-level keys only (nested object keys excluded)', ['label', 'href', 'tone', 'meta'], array_values($props));
+checkEquals('defineEmits call signatures yield event names', ['select', 'close'], array_values($emits));
+$indexSyms = $qe6->fileSymbols('resources/js/Pages/Sites/Index.vue');
+checkEquals('defineProps({...}) object form yields keys', ['sites', 'total'], array_values(array_column(array_filter($indexSyms, static fn (array $s): bool => $s['kind'] === 'prop'), 'name')));
+$firstProp = array_values(array_filter($tileSyms, static fn (array $s): bool => $s['kind'] === 'prop'))[0] ?? null;
+check('prop defs are owned by the component name', ($firstProp['ns'] ?? null) === 'StatTile', json_encode($firstProp));
+
+$tests = $qe6->tests('SiteController');
+check('tests: <Class>Test first, then referencing tests',
+    count($tests) === 1 && $tests[0]['file'] === 'tests/Unit/SiteControllerTest.php' && str_starts_with($tests[0]['how'], 'named'),
+    json_encode($tests));
+
+$ov = $qe6->overview();
+check('overview totals', $ov['totals']['routes'] === 4 && $ov['totals']['vue_pages'] === 2 && $ov['totals']['vue_components'] === 1 && $ov['totals']['tests'] === 2, json_encode($ov['totals']));
+
+// Incremental pass with nothing changed must not re-run artisan (routes kept, no notes).
+$indexer6b = new SourceIndexer($laravelRoot, $laravelDb);
+$indexer6b->build(false);
+check('incremental no-op keeps the route table', (new QueryEngine($laravelDb))->hasRoutes());
+
+// A project without artisan: route table empty, no notes, everything else works.
+$plainRoot = sys_get_temp_dir().DIRECTORY_SEPARATOR.'quickdex_plain_'.uniqid();
+register_shutdown_function(function () use (&$plainRoot) {
+    rrmdir($plainRoot);
+});
+mkdir($plainRoot, 0777, true);
+writeFixture($plainRoot, 'src/Thing.php', "<?php\nclass Thing {}\n");
+$indexer7 = new SourceIndexer($plainRoot, $plainRoot.DIRECTORY_SEPARATOR.'quickdex.db');
+$indexer7->build(true);
+$qe7 = new QueryEngine($plainRoot.DIRECTORY_SEPARATOR.'quickdex.db');
+check('non-Laravel project: no route table, no notes', ! $qe7->hasRoutes() && $indexer7->notes === [], implode(' | ', $indexer7->notes));
+
+unset($qe6, $indexer6, $indexer6b, $qe7, $indexer7);
+
 // ── Report ───────────────────────────────────────────────────────────────────
 
 echo "\n".str_repeat('─', 60)."\n";

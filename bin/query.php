@@ -204,7 +204,16 @@ if ($command === 'help' || $command === '--help' || $command === '-h') {
       search   <pattern>               Fuzzy search symbol names  (alias: find)
       uses     <trait>                 Classes that use a given trait
       patch    <class|path> <p1> ...   Check if file contains each pattern (✅/❌ + line)
-      route    <search>                Search route files for name/controller/URI/middleware
+      route    [search] [--all]        Laravel route table: method, URI, name, controller@action,
+                                        Inertia page, Ziggy group, file:line. Exact name → also
+                                        middleware + every route('name') caller. (alias: routes)
+      page     <Name|path.vue>         One Inertia page end to end: Vue file, controller(s) that
+                                        render it, routes + middleware, audience, route() calls
+                                        inside it with their Ziggy group (❌ = will throw), components
+      tests    <Class>                 Tests for a class: <Class>Test first, then tests referencing it
+      ziggy-check [-v]                 Lint every Vue page: route() calls vs the Ziggy groups the
+                                        page is served with. Exit 2 on violations.
+      overview                         Repo shape in one screen: files per area, routes, pages, tests
       grep     <p1> [p2 ...] [--dir a,b] [--ext php,vue,...]  Scan files for a literal string
                [--limit N] [-l|--files-only] [--all]           (multi-pattern = OR; -l lists files;
                                                                 --all includes lockfiles/*.min.*)
@@ -223,6 +232,12 @@ if ($command === 'help' || $command === '--help' || $command === '-h') {
       Blade files: @include/@extends/<x-component> become refs; @section() becomes a def
       Migration Schema::create/table/dropIfExists/drop are indexed by table name —
         use `def <table_name>` to find every migration touching a table
+      Laravel: the route table is read from `php artisan route:list --json` at index
+        time when ./artisan exists (QUICKDEX_NO_ARTISAN=1 skips it); Ziggy groups from
+        config/ziggy.php; Inertia::render('X') sites join routes to Vue pages
+      Vue: <template> child components, defineProps (kind=prop) and defineEmits
+        (kind=emit) are indexed; route('name') literals in PHP and Vue are refs, so
+        `refs sites.index` lists every caller
       Indexing is incremental by default (skips unchanged files by mtime);
         pass --force for a full rebuild
 
@@ -280,8 +295,12 @@ if (in_array($command, ['index', 'build', 'reindex', 'rebuild'], true)) {
     }
 
     $start = microtime(true);
-    (new \QuickDex\SourceIndexer($indexRoot, $indexDb))->build($force);
+    $indexer = new \QuickDex\SourceIndexer($indexRoot, $indexDb);
+    $indexer->build($force);
     printf("QuickDex built: %s (%.2fs)\n", $indexDb, microtime(true) - $start);
+    foreach ($indexer->notes as $note) {
+        echo "note: {$note}\n";
+    }
     exit(0);
 }
 
@@ -494,19 +513,156 @@ try {
             break;
 
         case 'route':
+        case 'routes':
             $search = arg($args, 0) ?? '';
-            if ($search === '') {
-                echo "Usage: quickdex route <search>\n";
-                exit(1);
+            if ($search === '' || str_starts_with($search, '-')) {
+                $search = '';
             }
-            $rows = $qe->route($search);
-            if (! $rows) {
-                echo "(no matches)\n";
-            } else {
-                foreach ($rows as $r) {
+            if (! $qe->hasRoutes()) {
+                // No route table (not Laravel, or artisan could not boot at index time).
+                if ($search === '') {
+                    echo "Usage: quickdex route <search>\n";
+                    exit(1);
+                }
+                $rows = $qe->routeGrep($search);
+                echo "(no route table — showing routes/*.php text matches; run `quickdex index` with a bootable app for the real table)\n";
+                foreach ($rows ?: [] as $r) {
                     echo "[{$r['file']}:{$r['line']}] {$r['content']}\n";
                 }
+                if (! $rows) {
+                    echo "(no matches)\n";
+                }
+                break;
             }
+            $rows = $qe->routes($search, in_array('--all', $args, true) ? 5000 : 60);
+            if (! $rows) {
+                echo "(no matching route — try `quickdex grep` if you expected a text hit)\n";
+                break;
+            }
+            $out = [];
+            foreach ($rows as $r) {
+                $out[] = [
+                    'method' => $r['method'],
+                    'uri' => '/'.ltrim($r['uri'], '/'),
+                    'name' => $r['name'] ?? '',
+                    'action' => $r['controller'] !== null
+                        ? preg_replace('/^App\\\\Http\\\\Controllers\\\\/', '', $r['controller']).'@'.$r['action_name']
+                        : $r['action'],
+                    'page' => $r['page'] ?? '',
+                    'ziggy' => $r['ziggy'] ?? '',
+                    'where' => $r['file'] !== null ? $r['file'].':'.$r['line'] : '',
+                ];
+            }
+            table($out, ['method', 'uri', 'name', 'action', 'page', 'ziggy', 'where']);
+            if (count($rows) >= 60 && ! in_array('--all', $args, true)) {
+                echo "(showing 60 — refine, or add --all)\n";
+            }
+            // One exact hit: also show its middleware and every caller of route('name').
+            if (count($rows) === 1 || ($rows[0]['name'] !== null && strcasecmp($rows[0]['name'], $search) === 0)) {
+                $r = $rows[0];
+                echo 'middleware: '.(implode(', ', $r['middleware']) ?: 'none')."\n";
+                if ($r['name'] !== null) {
+                    $callers = $qe->refs($r['name']);
+                    $callers = array_values(array_filter($callers, static fn (array $c): bool => ! str_starts_with($c['file'], 'routes/')));
+                    echo 'callers of route(\''.$r['name'].'\'): '.count($callers)."\n";
+                    foreach (array_slice($callers, 0, 40) as $c) {
+                        echo "  [{$c['file']}:{$c['line']}]\n";
+                    }
+                    if (count($callers) > 40) {
+                        echo '  ... '.(count($callers) - 40)." more — `quickdex refs {$r['name']}` for all\n";
+                    }
+                }
+            }
+            break;
+
+        case 'page':
+            $name = arg($args, 0) ?? '';
+            if ($name === '') {
+                echo "Usage: quickdex page <Inertia/Page/Name | resources/js/Pages/X.vue>\n";
+                exit(1);
+            }
+            $p = $qe->page($name);
+            if ($p['vue_file'] === null && $p['renders'] === [] && $p['routes'] === []) {
+                $np = autoRefreshQuery($dbPath, fn ($q) => ($x = $q->page($name)) && ($x['vue_file'] !== null || $x['renders'] !== []) ? [$x] : []);
+                if ($np === null || $np === []) {
+                    exit(1);
+                }
+                $p = $np[0];
+            }
+            echo "page:      {$p['page']}\n";
+            echo 'vue file:  '.($p['vue_file'] ?? '(none found under resources/js/Pages)')."\n";
+            echo 'audience:  '.implode(', ', $p['audience'])."\n";
+            echo 'rendered by: '.(count($p['renders']) ?: 'no static Inertia::render — rendered from data (Inertia::render($var))')."\n";
+            foreach ($p['renders'] as $r) {
+                echo "  [{$r['file']}:{$r['line']}] ".($r['owner'] ?? '(closure)')."\n";
+            }
+            if ($p['literals'] !== []) {
+                echo "name appears as a literal in:\n";
+                foreach ($p['literals'] as $l) {
+                    echo "  [{$l['file']}:{$l['line']}] ".mb_strimwidth($l['content'], 0, 110, '…')."\n";
+                }
+            }
+            echo 'routes:    '.(count($p['routes']) ?: 'none attributed')."\n";
+            foreach ($p['routes'] as $r) {
+                echo "  {$r['method']} /".ltrim($r['uri'], '/').'  '.($r['name'] ?? '(unnamed)').'  ziggy='.($r['ziggy'] ?? '-').'  mw='.implode(',', $r['middleware'])."\n";
+            }
+            echo 'route() calls in page: '.count($p['route_calls'])."\n";
+            foreach ($p['route_calls'] as $c) {
+                $flag = ! $c['defined'] ? '  ❌ NOT A ROUTE'
+                    : ($c['ziggy'] === null ? '  ❌ in no Ziggy group'
+                    : (array_intersect(explode(',', $c['ziggy']), $p['audience']) === [] && $p['routes'] !== [] ? '  ❌ not served to '.implode('/', $p['audience']) : ''));
+                if ($flag !== '' && $c['guard'] !== 'none') {
+                    $flag = '  ('.$c['guard'].' — would be ❌ otherwise)';
+                }
+                echo "  :{$c['line']}  {$c['name']}  [".($c['ziggy'] ?? '-')."]{$flag}\n";
+            }
+            echo 'components: '.(implode(', ', $p['components']) ?: 'none')."\n";
+            break;
+
+        case 'tests':
+            $class = bareSymbol(arg($args, 0) ?? '');
+            if ($class === '') {
+                echo "Usage: quickdex tests <Class>\n";
+                exit(1);
+            }
+            $rows = $qe->tests($class);
+            if (! $rows) {
+                $rows = autoRefreshQuery($dbPath, fn ($q) => $q->tests($class));
+                if ($rows === null) break;
+            }
+            table($rows, ['file', 'line', 'how']);
+            break;
+
+        case 'ziggy-check':
+        case 'ziggy':
+            if (! $qe->hasRoutes()) {
+                echo "No route table in the index — ziggy-check needs `php artisan route:list` to have run at index time.\n";
+                exit(1);
+            }
+            $z = $qe->ziggyCheck();
+            printf("%d page(s) checked, %d unattributed (no route renders them by a static name), %d call(s) guarded by an auth check, %d violation(s)\n", $z['checked'], count($z['unattributed']), $z['guarded'], count($z['violations']));
+            foreach ($z['violations'] as $v) {
+                echo "  ❌ [{$v['vue_file']}:{$v['line']}] route('{$v['route']}') — {$v['reason']}; page audience: ".implode('/', $v['audience']).'; route group: '.($v['ziggy'] ?? 'none')."\n";
+            }
+            if (in_array('--verbose', $args, true) || in_array('-v', $args, true)) {
+                foreach ($z['unattributed'] as $u) {
+                    echo "  ? {$u}\n";
+                }
+            } elseif ($z['unattributed'] !== []) {
+                echo "(add -v to list unattributed pages)\n";
+            }
+            echo "Note: 'guarded' = an auth check (v-if on the user, isAuthed ternary) within 25 lines above the call — heuristic, read the line before trusting it. Layouts/components are not linted, only pages.\n";
+            exit($z['violations'] === [] ? 0 : 2);
+
+        case 'overview':
+            $o = $qe->overview();
+            $meta = $qe->meta();
+            echo 'root: '.($meta['root'] ?? '?').'  indexed: '.($meta['generated_at'] ?? '?')."\n";
+            $t = $o['totals'];
+            echo "files {$t['files']} · classes {$t['classes']} · tests {$t['tests']} · migrations {$t['migrations']}\n";
+            echo "routes {$t['routes']} ({$t['routes_app']} app) · inertia pages rendered {$t['inertia_pages']} · vue pages {$t['vue_pages']} · vue components {$t['vue_components']}\n\n";
+            table($o['areas'], ['area', 'files', 'lines']);
+            echo "\nNext: quickdex route <name> · quickdex page <Page> · quickdex tests <Class> · quickdex ziggy-check\n";
             break;
 
         case 'grep':

@@ -112,7 +112,11 @@ quickdex <command> [args]
 | `search <pattern>` | Fuzzy search across all symbol names. Namespace prefix stripped. (alias: `find`) |
 | `uses <Trait>` | Classes that use a given trait |
 | `patch <Class\|path> <p1> ...` | Check whether a file contains each pattern (✅/❌ + line) |
-| `route <search>` | Search route files for a name/controller/URI/middleware |
+| `route [search] [--all]` | **Laravel route table** (from `php artisan route:list --json` at index time): method, URI, name, `Controller@action`, the Inertia page it renders, its Ziggy group, and `file:line`. An exact name also prints middleware and every `route('name')` caller. Falls back to a text search of `routes/*.php` when the project has no route table. (alias: `routes`) |
+| `page <Name\|path.vue>` | One Inertia page end to end: Vue file, controller(s)/closure that render it, routes + middleware, audience, every `route()` call inside it with its Ziggy group (❌ where Ziggy would throw), child components |
+| `tests <Class>` | Tests for a class: `<Class>Test` first, then every file under `tests/` that references it |
+| `ziggy-check [-v]` | Lint every Vue page: `route()` calls vs the Ziggy groups the page is served with. Exit 2 on violations. Calls guarded by `v-if` on the user / an `isAuthed` ternary are counted, not flagged |
+| `overview` | Repo shape on one screen: files and lines per area, routes, pages, components, tests, migrations |
 | `grep <p1> [p2 ...] [--dir a,b] [--ext php,vue,...] [--limit N] [-l\|--files-only] [--all]` | Scan files for a literal string (case-insensitive substring, not regex). Multiple patterns = OR (separate args, not `\|`/regex — crashes the Windows `.bat`). `--dir` accepts a comma-separated list and **errors** on an invalid path (not a silent `(no matches)`). `--limit` caps rows (default 200); `-l`/`--files-only` lists matching files once; lockfiles + `*.min.*` are excluded unless `--all` |
 | `index [root] [db] [--force]` | Build or rebuild the index (aliases: `build`, `reindex`, `rebuild`) |
 | `meta` | Show index metadata (timestamp, file count, last build mode) |
@@ -193,6 +197,11 @@ QUICKDEX_DB=/path/to/quickdex.db quickdex def User
 | Imports / refs | `use` statements **+ inline usages** (`new X`, `X::`, `extends`/`implements`, type hints — incl. same-namespace siblings, via the native tokenizer so comments/strings are skipped) | `import` | `import` | `@include`/`@extends`/`@component`/`<x-component>` | `import` (single-line + grouped block) | `import` / `from ... import ...` |
 | Class hierarchy | extends + implements + traits | — | — | — | — | — |
 | Migrations | `Schema::create/table/dropIfExists/drop` indexed as `kind=table:<op>`, `name=<table>` — `def <table>` finds every migration touching it | — | — | — |
+| Props / emits | — | `defineProps` (`kind=prop`) and `defineEmits` (`kind=emit`), `ns=<component>`; TS generic, interface-backed, object and array forms | — | — |
+| Template usage | — | every child component tag in `<template>` (`<StatTile>`, `<app-button>` → `AppButton`) is a ref | — | — |
+| Route names | `route('x')` / `to_route('x')` literals are refs on `x` | `route('x')` in script and template | same | — |
+| Inertia pages | `Inertia::render('X')` / `inertia('X')` → `pages` table with the owning `Class@method` | — | — | — |
+| Routes | `php artisan route:list --json` → `routes` table (needs `./artisan`; `QUICKDEX_NO_ARTISAN=1` skips); Ziggy groups from `config/ziggy.php` | — | — | — |
 
 JS/TS indexing intentionally skips inner-scope variables — only exported and top-level symbols are indexed to avoid noise. `.blade.php` files are indexed as `type=blade` — `refs x-email.layout` finds every view using that component.
 
@@ -203,8 +212,15 @@ files      (path, type, lines, ns, summary, mtime)              -- mtime drives 
 defs       (name, kind, file, line, end_line, ns, generated)    -- indexed on name; end_line backs `body`; generated=1 downranks Wayfinder output
 refs       (symbol, file, line)                                 -- usage index (imports + inline class refs), with line numbers
 hierarchy  (class, extends, implements, traits)
-meta       (key, value)                                          -- schema version (currently 2.1); a bump forces a full rebuild on upgrade
+routes     (name, method, uri, action, controller, action_name, middleware, file, line, page, ziggy)  -- Laravel only
+pages      (page, file, line, owner)                            -- Inertia::render sites; owner = Class@method
+meta       (key, value)                                          -- schema version (currently 3.0); a bump forces a full rebuild on upgrade
 ```
+
+The route table is rebuilt whenever an index pass touched or purged at least one
+file (or the table is empty); a no-op incremental pass leaves it alone. Booting the
+app takes a second or two; if it fails (no `.env` in a fresh worktree, say) the
+indexer prints a `note:` and keeps the previous rows.
 
 Schema version bumps are handled transparently: a query issued against an
 older-schema `quickdex.db` auto-rebuilds once (`(index schema updated — rebuilt)`)
@@ -228,6 +244,7 @@ QuickDex/
   bin/
     index.php        CLI entry point — builds the SQLite index
     query.php        CLI entry point — queries the index
+    ziggy-groups.php Helper: prints config/ziggy.php groups as JSON (run in a subprocess by the indexer)
     quickdex         Unix wrapper (Linux + macOS) — add to PATH
     quickdex.bat     Windows wrapper — add bin/ to PATH
   src/

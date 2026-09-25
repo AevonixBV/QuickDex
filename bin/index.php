@@ -40,3 +40,6 @@ $indexer->build($force);
 $elapsed = round(microtime(true) - $start, 2);
 
 printf("QuickDex built: %s (%.2fs)\n", $dbPath, $elapsed);
+foreach ($indexer->notes as $note) {
+    echo "note: {$note}\n";
+}

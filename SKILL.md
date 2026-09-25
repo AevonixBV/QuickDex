@@ -3,7 +3,7 @@ name: quickdex
 description: "Use the QuickDex SQLite symbol index to locate PHP/Vue/TS/JS symbols and file ownership before reading file contents. This reduces token cost and improves search accuracy."
 license: MIT
 metadata:
-  author: read-reducer
+  author: Aevonix
   version: "3.1.0"
   domain: tooling
   role: assistant
@@ -49,7 +49,11 @@ Fallback: `php QuickDex/bin/query.php <command> [args]`
 | `search <pattern>` | Fuzzy search across all symbol names. Namespace prefix stripped. (alias: `find`) |
 | `uses <TraitName>` | All classes that use a given trait |
 | `patch <Class\|path> <p1> …` | Check if file contains each pattern — ✅/❌ + line, no context |
-| `route <search>` | Search all route files for a name, controller, URI, or middleware string |
+| `route [search]` | **Laravel route table**: method, URI, name, `Controller@action`, Inertia page, Ziggy group, `file:line`. Exact name → also middleware + every `route('name')` caller. Use this before opening `routes/*.php` or a controller |
+| `page <Name\|path.vue>` | **Start here for any Inertia page work.** Vue file, controller(s) rendering it, routes + middleware, audience, every `route()` call with its Ziggy group (❌ = Ziggy will throw on render), child components |
+| `tests <Class>` | Which tests cover a class — run these first, not the suite |
+| `ziggy-check` | Lint all pages for `route()` calls outside the page's Ziggy groups. Run after touching a Vue page's links or `config/ziggy.php`; exit 2 = violation |
+| `overview` | Repo shape in one screen — the first call in a fresh session, instead of `ls -R` |
 | `grep <p1> [p2 …] [--dir a,b] [--ext …] [--limit N] [-l] [--all]` | Scan files for a literal string (case-insensitive substring, not regex) — content search, not symbol lookup. Multiple patterns = OR. `--dir` takes a comma list and errors on a bad path; `-l`/`--files-only` lists files once; `--limit` caps rows (default 200); `--all` includes lockfiles/`*.min.*` |
 | `index [--force]` | Build or rebuild the index (aliases: `build`, `reindex`, `rebuild`) |
 | `meta` | Index timestamp and total file count |
@@ -127,8 +131,17 @@ quickdex grep "prometheus" --dir monitoring_config
 # are cmd.exe metacharacters the .bat wrapper's argument passthrough hits:
 quickdex grep --% "request()->all()" --dir app --ext php
 
-# Find route definition without reading route files manually
+# Route → controller@action → Inertia page → Ziggy group, plus every caller
 quickdex route "expenses.approve"
+
+# Everything about one Inertia page (backend and frontend) in one call
+quickdex page "Admin/Backlinks/Index"
+
+# Which tests exercise a class
+quickdex tests GeoScoreService
+
+# Will any page throw in Ziggy because it links a route its audience never receives?
+quickdex ziggy-check
 
 # Incremental rebuild (automatic on stale empty results; or force manually)
 quickdex index
@@ -141,7 +154,9 @@ See `TOKEN_REDUCTION.md` for the full ruleset. Quick summary:
 - `body` replaces `def` + a full-file (or generously-ranged) `Read` — the most common "find it, then read it" round trip collapses into one call
 - `patch` replaces N existence-greps — returns ✅/❌ per pattern, zero context lines
 - `uses` replaces `grep -rn "use TraitName"` across the whole tree
-- `route` replaces the `ls routes/` → grep → Read chain
+- `route` replaces the `ls routes/` → grep → Read chain, and the controller Read that used to follow it
+- `page` replaces the route grep → controller Read → Vue Read → `config/ziggy.php` Read chain for Inertia work
+- `tests <Class>` replaces `grep -rl ClassName tests/`
 - No `-A`/`-B`/`-C` grep flags when the answer is yes/no
 - For plan/feature done checks: `git log` → parallel `ls` of expected files → `patch` only HIGH-risk items
 

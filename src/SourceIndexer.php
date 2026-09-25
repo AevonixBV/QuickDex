@@ -11,13 +11,16 @@ final class SourceIndexer
      * the stored meta value and forces a full rebuild on mismatch, so an
      * incremental pass never runs against columns that don't exist yet.
      */
-    public const SCHEMA_VERSION = '2.1';
+    public const SCHEMA_VERSION = '3.0';
 
     private \PDO $db;
 
     private string $root;
 
     private string $dbPath;
+
+    /** Human-readable notes from the last build (artisan skipped, Ziggy config unreadable, ...). */
+    public array $notes = [];
 
     /**
      * Bare entries match any single path segment of that name; entries containing
@@ -30,6 +33,7 @@ final class SourceIndexer
         'node_modules',
         '.git',
         '.claude',
+        '.codex',
         'storage',
         'tmp',
         '.idea',
@@ -89,8 +93,19 @@ final class SourceIndexer
             $indexed++;
         }
 
+        $purged = 0;
         if ($incremental) {
-            $this->purgeMissingFiles($seen);
+            $purged = $this->purgeMissingFiles($seen);
+        }
+
+        // Laravel layer: the route table comes from the framework itself (artisan),
+        // not from parsing routes/*.php — groups, prefixes, resource() expansions and
+        // middleware stacks are only knowable after Laravel has booted them. Re-run
+        // whenever anything changed (a route file, a controller, a Ziggy group) or
+        // the table is empty; skipping it on a no-op incremental pass keeps the
+        // stale-index auto-refresh cheap.
+        if ($indexed > 0 || $purged > 0 || ! $incremental || $this->routeCount() === 0) {
+            $this->indexLaravelRoutes();
         }
 
         $this->db->prepare('DELETE FROM meta')->execute();
@@ -154,6 +169,7 @@ final class SourceIndexer
 
         $this->db->prepare('DELETE FROM defs WHERE file = ?')->execute([$rel]);
         $this->db->prepare('DELETE FROM refs WHERE file = ?')->execute([$rel]);
+        $this->db->prepare('DELETE FROM pages WHERE file = ?')->execute([$rel]);
         $this->db->prepare('DELETE FROM files WHERE path = ?')->execute([$rel]);
 
         if ($classes) {
@@ -163,16 +179,20 @@ final class SourceIndexer
     }
 
     /** Purge rows for any previously-indexed file that's gone or no longer matches the include filters. */
-    private function purgeMissingFiles(array $seen): void
+    private function purgeMissingFiles(array $seen): int
     {
         $stmt = $this->db->query('SELECT path FROM files');
         $known = array_column($stmt->fetchAll(\PDO::FETCH_ASSOC), 'path');
+        $purged = 0;
 
         foreach ($known as $path) {
             if (! isset($seen[$path])) {
                 $this->removeFileData($path);
+                $purged++;
             }
         }
+
+        return $purged;
     }
 
     private function createFresh(string $dbPath): \PDO
@@ -199,6 +219,8 @@ final class SourceIndexer
             DROP TABLE IF EXISTS defs;
             DROP TABLE IF EXISTS refs;
             DROP TABLE IF EXISTS hierarchy;
+            DROP TABLE IF EXISTS routes;
+            DROP TABLE IF EXISTS pages;
 
             CREATE TABLE meta (
                 key   TEXT PRIMARY KEY,
@@ -239,11 +261,46 @@ final class SourceIndexer
                 traits     TEXT
             );
 
+            -- Laravel route table, filled from php artisan route:list --json (see
+            -- indexLaravelRoutes). One row per registered route. `file`/`line` point
+            -- at the controller method (or the closure in routes/*.php); `page` is the
+            -- Inertia page that method renders, if it renders exactly one; `ziggy` is
+            -- the comma-joined config/ziggy.php group(s) whose patterns match `name`.
+            CREATE TABLE routes (
+                id          INTEGER PRIMARY KEY,
+                name        TEXT,
+                method      TEXT NOT NULL,
+                uri         TEXT NOT NULL,
+                action      TEXT NOT NULL,
+                controller  TEXT,
+                action_name TEXT,
+                middleware  TEXT NOT NULL DEFAULT "[]",
+                file        TEXT,
+                line        INTEGER,
+                page        TEXT,
+                ziggy       TEXT
+            );
+
+            -- Inertia::render(Some/Page) / inertia(Some/Page) call sites, one row
+            -- each. `owner` is Class@method when the call sits inside a class method,
+            -- so routes.page can be joined without re-parsing.
+            CREATE TABLE pages (
+                id    INTEGER PRIMARY KEY,
+                page  TEXT NOT NULL,
+                file  TEXT NOT NULL,
+                line  INTEGER NOT NULL,
+                owner TEXT
+            );
+
             CREATE INDEX idx_defs_name       ON defs(name);
             CREATE INDEX idx_defs_name_lower ON defs(LOWER(name));
             CREATE INDEX idx_defs_file       ON defs(file);
             CREATE INDEX idx_refs_symbol     ON refs(symbol);
             CREATE INDEX idx_refs_file       ON refs(file);
+            CREATE INDEX idx_routes_name     ON routes(name);
+            CREATE INDEX idx_routes_page     ON routes(page);
+            CREATE INDEX idx_pages_page      ON pages(page);
+            CREATE INDEX idx_pages_file      ON pages(file);
         ');
 
         return $db;
@@ -294,7 +351,7 @@ final class SourceIndexer
 
         $data = match (true) {
             $isBlade          => $this->parseBlade($content),
-            $ext === 'vue'    => $this->parseVue($content),
+            $ext === 'vue'    => $this->parseVue($content, $rel),
             $ext === 'js', $ext === 'ts' => $this->parseScript($content, $ext),
             $ext === 'go'     => $this->parseGo($content),
             $ext === 'py'     => $this->parsePython($content),
@@ -348,6 +405,218 @@ final class SourceIndexer
                 json_encode($h['traits']),
             ]);
         }
+
+        $pageStmt = $this->db->prepare('INSERT INTO pages (page, file, line, owner) VALUES (?, ?, ?, ?)');
+        foreach ($data['pages'] ?? [] as $page) {
+            $pageStmt->execute([$page['page'], $rel, $page['line'], $page['owner']]);
+        }
+    }
+
+    // ── Laravel routes ───────────────────────────────────────────────────────
+
+    private function routeCount(): int
+    {
+        return (int) $this->db->query('SELECT COUNT(*) FROM routes')->fetchColumn();
+    }
+
+    /**
+     * Fill the routes table from `php artisan route:list --json`. Only runs when the
+     * root has an `artisan` file; a boot failure (fresh worktree without .env, broken
+     * provider) leaves the previous rows in place and records a note rather than
+     * failing the whole index — the symbol index is still valid without routes.
+     *
+     * Set QUICKDEX_NO_ARTISAN=1 to skip (CI, or a box where booting the app is unsafe).
+     */
+    private function indexLaravelRoutes(): void
+    {
+        $artisan = $this->root.DIRECTORY_SEPARATOR.'artisan';
+        if (! is_file($artisan) || getenv('QUICKDEX_NO_ARTISAN')) {
+            return;
+        }
+
+        $json = $this->runInRoot('php artisan route:list --json --no-interaction');
+        $routes = $json === null ? null : json_decode($json, true);
+
+        if (! is_array($routes)) {
+            $this->notes[] = 'routes: `php artisan route:list --json` did not return JSON — route table left as-is. Check the app boots (.env present?).';
+
+            return;
+        }
+
+        $ziggyGroups = $this->loadZiggyGroups();
+
+        $this->db->exec('DELETE FROM routes');
+        $stmt = $this->db->prepare(
+            'INSERT INTO routes (name, method, uri, action, controller, action_name, middleware, file, line, page, ziggy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        );
+
+        foreach ($routes as $route) {
+            $action = (string) ($route['action'] ?? '');
+            $name = $route['name'] ?? null;
+            $controller = null;
+            $actionName = null;
+            $file = null;
+            $line = null;
+            $page = null;
+
+            if ($action !== '' && $action !== 'Closure') {
+                if (str_contains($action, '@')) {
+                    [$controller, $actionName] = explode('@', $action, 2);
+                } else {
+                    $controller = $action;
+                    $actionName = '__invoke';
+                }
+                $controller = ltrim($controller, '\\');
+                $located = $this->locateControllerAction($controller, $actionName);
+                if ($located !== null) {
+                    [$file, $line] = $located;
+                    $short = substr($controller, strrpos($controller, '\\') !== false ? strrpos($controller, '\\') + 1 : 0);
+                    $page = $this->pageRenderedBy($file, $short.'@'.$actionName);
+                }
+            } elseif (! empty($route['path']) && preg_match('/^(.*):(\d+)$/', (string) $route['path'], $m)) {
+                // Closure route: artisan reports "routes/web.php:372".
+                $file = str_replace('\\', '/', $m[1]);
+                $line = (int) $m[2];
+                $page = $this->pageRenderedAt($file, $line);
+            }
+
+            $stmt->execute([
+                $name,
+                (string) ($route['method'] ?? ''),
+                (string) ($route['uri'] ?? ''),
+                $action,
+                $controller,
+                $actionName,
+                json_encode(array_values((array) ($route['middleware'] ?? []))),
+                $file,
+                $line,
+                $page,
+                $name === null ? null : $this->ziggyGroupsFor((string) $name, $ziggyGroups),
+            ]);
+        }
+    }
+
+    /** @return array{0: string, 1: int}|null  [relative file, line] of Controller::method */
+    private function locateControllerAction(string $fqcn, string $method): ?array
+    {
+        $pos = strrpos($fqcn, '\\');
+        $short = $pos === false ? $fqcn : substr($fqcn, $pos + 1);
+        $ns = $pos === false ? null : substr($fqcn, 0, $pos);
+
+        $stmt = $this->db->prepare(
+            "SELECT file FROM defs WHERE kind = 'class' AND name = ? AND (ns = ? OR ? IS NULL) ORDER BY generated, file LIMIT 1"
+        );
+        $stmt->execute([$short, $ns, $ns]);
+        $file = $stmt->fetchColumn();
+        if ($file === false) {
+            return null;
+        }
+
+        $stmt = $this->db->prepare("SELECT line FROM defs WHERE kind = 'method' AND file = ? AND name = ? LIMIT 1");
+        $stmt->execute([$file, $method]);
+        $line = $stmt->fetchColumn();
+
+        // Inherited action (e.g. a base landing controller): file known, line not.
+        return [(string) $file, $line === false ? 0 : (int) $line];
+    }
+
+    /** The one page a method renders, or null when it renders none or several. */
+    private function pageRenderedBy(string $file, string $owner): ?string
+    {
+        $stmt = $this->db->prepare('SELECT DISTINCT page FROM pages WHERE file = ? AND owner = ?');
+        $stmt->execute([$file, $owner]);
+        $pages = $stmt->fetchAll(\PDO::FETCH_COLUMN);
+
+        return count($pages) === 1 ? (string) $pages[0] : null;
+    }
+
+    /** For a closure route at routes/x.php:N — the first render call after that line, before the next closure route. */
+    private function pageRenderedAt(string $file, int $line): ?string
+    {
+        $stmt = $this->db->prepare('SELECT page FROM pages WHERE file = ? AND line >= ? AND line <= ? ORDER BY line LIMIT 1');
+        $stmt->execute([$file, $line, $line + 12]);
+        $page = $stmt->fetchColumn();
+
+        return $page === false ? null : (string) $page;
+    }
+
+    /**
+     * config/ziggy.php `groups` (tightenco/ziggy): group name => list of route-name
+     * patterns (`exact.name` or `prefix.*`). Loaded by including the config in a
+     * separate PHP process so a config that calls env()/config() cannot take the
+     * indexer down. Returns [] when the file is absent or unreadable.
+     *
+     * @return array<string, list<string>>
+     */
+    private function loadZiggyGroups(): array
+    {
+        $config = $this->root.DIRECTORY_SEPARATOR.'config'.DIRECTORY_SEPARATOR.'ziggy.php';
+        if (! is_file($config)) {
+            return [];
+        }
+
+        $helper = dirname(__DIR__).DIRECTORY_SEPARATOR.'bin'.DIRECTORY_SEPARATOR.'ziggy-groups.php';
+        $json = $this->runInRoot('php '.escapeshellarg($helper).' '.escapeshellarg($config));
+        $groups = $json === null ? null : json_decode($json, true);
+
+        if (! is_array($groups)) {
+            $this->notes[] = 'ziggy: config/ziggy.php exists but its `groups` could not be read — routes.ziggy left empty.';
+
+            return [];
+        }
+
+        $out = [];
+        foreach ($groups as $group => $patterns) {
+            if (is_array($patterns)) {
+                $out[(string) $group] = array_values(array_filter(array_map('strval', $patterns)));
+            }
+        }
+
+        return $out;
+    }
+
+    /** @param array<string, list<string>> $groups */
+    private function ziggyGroupsFor(string $routeName, array $groups): ?string
+    {
+        $hits = [];
+        foreach ($groups as $group => $patterns) {
+            foreach ($patterns as $pattern) {
+                if ($pattern === $routeName
+                    || (str_ends_with($pattern, '*') && str_starts_with($routeName, substr($pattern, 0, -1)))) {
+                    $hits[] = $group;
+                    break;
+                }
+            }
+        }
+
+        return $hits === [] ? null : implode(',', $hits);
+    }
+
+    /** Run a shell command with cwd = project root; stdout on exit 0, else null (stderr goes to notes). */
+    private function runInRoot(string $command): ?string
+    {
+        $spec = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+        $proc = @proc_open($command, $spec, $pipes, $this->root);
+        if (! is_resource($proc)) {
+            $this->notes[] = "could not start: {$command}";
+
+            return null;
+        }
+
+        fclose($pipes[0]);
+        $stdout = (string) stream_get_contents($pipes[1]);
+        $stderr = (string) stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        $exit = proc_close($proc);
+
+        if ($exit !== 0) {
+            $this->notes[] = "`{$command}` exited {$exit}: ".trim(substr($stderr !== '' ? $stderr : $stdout, 0, 300));
+
+            return null;
+        }
+
+        return $stdout;
     }
 
     // ── PHP ──────────────────────────────────────────────────────────────────
@@ -529,6 +798,35 @@ final class SourceIndexer
             $refs[] = $ref;
         }
 
+        // route('name') / to_route('name') / ->route('name') string literals → refs on
+        // the bare route name, so `refs sites.index` lists every caller (PHP and Vue
+        // alike — see parseScriptContent) next to the route table's definition.
+        foreach ($this->extractRouteNameRefs($content) as $ref) {
+            $refs[] = $ref;
+        }
+
+        // Inertia page renders, with the owning Class@method so routes can be joined.
+        $methodRanges = [];
+        foreach ($defs as $def) {
+            if ($def['kind'] === 'method') {
+                $methodRanges[] = ['name' => ($def['ns'] ?? '').'@'.$def['name'], 'start' => $def['line'], 'end' => $def['end_line']];
+            }
+        }
+        $pages = [];
+        if (preg_match_all('/(?:Inertia::render|\binertia)\(\s*[\'"]([A-Za-z0-9_\/.\-]+)[\'"]/', $content, $m, PREG_OFFSET_CAPTURE)) {
+            foreach ($m[1] as $match) {
+                $line = $this->lineAt($content, $match[1]);
+                $owner = null;
+                foreach ($methodRanges as $range) {
+                    if ($line >= $range['start'] && $line <= $range['end']) {
+                        $owner = $range['name'];
+                        break;
+                    }
+                }
+                $pages[] = ['page' => $match[0], 'line' => $line, 'owner' => $owner];
+            }
+        }
+
         $summary = $this->buildSummary($counts, substr_count($content, "\n") + 1);
 
         return [
@@ -537,8 +835,22 @@ final class SourceIndexer
             'defs'      => $defs,
             'refs'      => $refs,
             'hierarchy' => $hierarchy,
+            'pages'     => $pages,
             'summary'   => $summary,
         ];
+    }
+
+    /** @return list<array{symbol: string, line: int}> */
+    private function extractRouteNameRefs(string $content): array
+    {
+        $refs = [];
+        if (preg_match_all('/\broute\(\s*[\'"]([A-Za-z0-9_.\-:]+)[\'"]/', $content, $m, PREG_OFFSET_CAPTURE)) {
+            foreach ($m[1] as $match) {
+                $refs[] = ['symbol' => $match[0], 'line' => $this->lineAt($content, $match[1])];
+            }
+        }
+
+        return $refs;
     }
 
     /**
@@ -1057,10 +1369,11 @@ final class SourceIndexer
 
     // ── Vue ──────────────────────────────────────────────────────────────────
 
-    private function parseVue(string $content): array
+    private function parseVue(string $content, string $rel = ''): array
     {
         $defs = [];
         $refs = [];
+        $component = $rel === '' ? null : basename($rel, '.vue');
 
         if (preg_match_all('/(<script\b[^>]*>)(.*?)<\/script>/is', $content, $scriptMatches, PREG_SET_ORDER | PREG_OFFSET_CAPTURE)) {
             foreach ($scriptMatches as $scriptMatch) {
@@ -1069,10 +1382,40 @@ final class SourceIndexer
                 $jsData = $this->parseScriptContent($scriptContent, $scriptOffset, $content);
                 $defs = array_merge($defs, $jsData['defs']);
                 $refs = array_merge($refs, $jsData['refs']);
+
+                foreach ($this->extractVueMacros($scriptContent, $scriptOffset, $content) as $def) {
+                    $def['ns'] = $component;
+                    $defs[] = $def;
+                }
+            }
+        }
+
+        // <template> usage. Every child component tag (<AccountStatTile>, <app-button>)
+        // becomes a ref on its PascalCase name, so `refs AccountStatTile` shows where the
+        // component is actually placed, not only the import line. Script/style blocks are
+        // blanked (not removed) so offsets and line numbers stay those of the real file.
+        $markup = preg_replace_callback(
+            '/<(script|style)\b[^>]*>.*?<\/\1>/is',
+            static fn (array $m): string => preg_replace('/[^\n]/', ' ', $m[0]),
+            $content
+        ) ?? '';
+        if (preg_match_all('/<([A-Z][A-Za-z0-9]*|[a-z][a-z0-9]*(?:-[a-z0-9]+)+)\b/', $markup, $m, PREG_OFFSET_CAPTURE)) {
+            foreach ($m[1] as $match) {
+                $tag = $match[0];
+                if (str_contains($tag, '-')) {
+                    $tag = str_replace(' ', '', ucwords(str_replace('-', ' ', $tag)));
+                }
+                $refs[] = ['symbol' => $tag, 'line' => $this->lineAt($markup, $match[1])];
             }
         }
 
         $lines = substr_count($content, "\n") + 1;
+        $props = count(array_filter($defs, static fn (array $d): bool => $d['kind'] === 'prop'));
+        $emits = count(array_filter($defs, static fn (array $d): bool => $d['kind'] === 'emit'));
+        $summary = count($defs).' def(s)'
+            .($props ? "; {$props} prop(s)" : '')
+            .($emits ? "; {$emits} emit(s)" : '')
+            .'; '.count(array_unique(array_column($refs, 'symbol'))).' import/component ref(s); '.$lines.' lines';
 
         return [
             'type'      => 'vue',
@@ -1080,8 +1423,110 @@ final class SourceIndexer
             'defs'      => $defs,
             'refs'      => $refs,
             'hierarchy' => [],
-            'summary'   => count($defs).' def(s); '.count(array_unique(array_column($refs, 'symbol'))).' import(s); '.$lines.' lines',
+            'summary'   => $summary,
         ];
+    }
+
+    /**
+     * defineProps / defineEmits (script setup) → defs of kind `prop` / `emit`.
+     * Handles the TS generic form (`defineProps<{ a: string }>()`, `defineProps<Props>()`
+     * resolved through a local `interface Props {}` / `type Props = {}`), the object
+     * form (`defineProps({ a: String })`), the array form (`defineProps(['a'])`),
+     * `withDefaults(defineProps<...>(), {...})`, and emits as call signatures
+     * (`(e: 'save', id: number): void`), named tuples (`save: [id: number]`) or arrays.
+     *
+     * @return list<array{name: string, kind: string, line: int, end_line: int}>
+     */
+    private function extractVueMacros(string $script, int $baseOffset, string $full): array
+    {
+        $defs = [];
+
+        foreach (['defineProps' => 'prop', 'defineEmits' => 'emit'] as $macro => $kind) {
+            if (! preg_match('/\b'.$macro.'\b\s*(<|\()/', $script, $m, PREG_OFFSET_CAPTURE)) {
+                continue;
+            }
+            $open = $m[1][1];
+            $isGeneric = $m[1][0] === '<';
+            $block = '';
+            $blockOffset = 0;
+
+            if ($isGeneric) {
+                $close = $this->findMatchingDelimiter($script, $open, '<', '>');
+                $generic = trim(substr($script, $open + 1, $close - $open - 1));
+                if (preg_match('/^[A-Za-z_$][\w$]*$/', $generic)) {
+                    // defineProps<Props>() — find `interface Props {` / `type Props = {`
+                    if (preg_match('/\b(?:interface|type)\s+'.preg_quote($generic, '/').'\b[^{]*\{/', $script, $tm, PREG_OFFSET_CAPTURE)) {
+                        $brace = $tm[0][1] + strlen($tm[0][0]) - 1;
+                        $end = $this->findMatchingDelimiter($script, $brace, '{', '}');
+                        $block = substr($script, $brace, $end - $brace + 1);
+                        $blockOffset = $brace;
+                    }
+                } elseif (str_starts_with($generic, '{')) {
+                    $brace = strpos($script, '{', $open);
+                    $end = $this->findMatchingDelimiter($script, $brace, '{', '}');
+                    $block = substr($script, $brace, $end - $brace + 1);
+                    $blockOffset = $brace;
+                }
+            } else {
+                $close = $this->findMatchingDelimiter($script, $open, '(', ')');
+                $inner = substr($script, $open + 1, $close - $open - 1);
+                $trimmed = ltrim($inner);
+                $lead = $open + 1 + (strlen($inner) - strlen($trimmed));
+                if (str_starts_with($trimmed, '{')) {
+                    $end = $this->findMatchingDelimiter($script, $lead, '{', '}');
+                    $block = substr($script, $lead, $end - $lead + 1);
+                    $blockOffset = $lead;
+                } elseif (str_starts_with($trimmed, '[')) {
+                    // Array form: names are string literals.
+                    if (preg_match_all('/[\'"]([A-Za-z_$][\w$:-]*)[\'"]/', $trimmed, $sm, PREG_OFFSET_CAPTURE)) {
+                        foreach ($sm[1] as $s) {
+                            $line = $this->lineAt($full, $lead + $s[1] + $baseOffset);
+                            $defs[] = ['name' => $s[0], 'kind' => $kind, 'line' => $line, 'end_line' => $line];
+                        }
+                    }
+
+                    continue;
+                }
+            }
+
+            if ($block === '') {
+                continue;
+            }
+
+            // Top-level members of the block: split its inside at depth-0 `;` `,` and
+            // newlines, then read `name?: type` / `name: String` / `name: [..]` off each
+            // segment. A nested object value stays inside its segment (depth > 0), so
+            // its keys never leak out as props. Call-signature emits
+            // `(e: 'save', id: number): void` carry the name in the literal.
+            $inner = substr($block, 1, -1);
+            $depth = 0;
+            $segStart = 0;
+            $len = strlen($inner);
+            for ($i = 0; $i <= $len; $i++) {
+                $ch = $i < $len ? $inner[$i] : "\n";
+                if ($depth === 0 && ($ch === ';' || $ch === ',' || $ch === "\n")) {
+                    $segment = substr($inner, $segStart, $i - $segStart);
+                    $name = null;
+                    if ($kind === 'emit' && preg_match('/^\s*\(\s*e\w*\s*:\s*[\'"]([^\'"]+)[\'"]/', $segment, $km)) {
+                        $name = $km[1];
+                    } elseif (preg_match('/^\s*(?:readonly\s+)?([A-Za-z_$][\w$]*)\s*\??\s*:/', $segment, $km)) {
+                        $name = $km[1];
+                    }
+                    if ($name !== null) {
+                        $lead = strlen($segment) - strlen(ltrim($segment));
+                        $line = $this->lineAt($full, $blockOffset + 1 + $segStart + $lead + $baseOffset);
+                        $defs[] = ['name' => $name, 'kind' => $kind, 'line' => $line, 'end_line' => $line];
+                    }
+                    $segStart = $i + 1;
+                } elseif ($ch === '{' || $ch === '[' || $ch === '(' || $ch === '<') {
+                    $depth++;
+                } elseif ($ch === '}' || $ch === ']' || $ch === ')' || ($ch === '>' && ($i === 0 || $inner[$i - 1] !== '='))) {
+                    $depth--; // `=>` is an arrow, not a generic close
+                }
+            }
+        }
+
+        return $defs;
     }
 
     // ── Blade ────────────────────────────────────────────────────────────────
@@ -1298,6 +1743,12 @@ final class SourceIndexer
                     $refs[] = ['symbol' => $name, 'line' => $this->lineAt($full, $match[1] + $baseOffset)];
                 }
             }
+        }
+
+        // Ziggy route('name') calls — same symbol shape as the PHP side. For a Vue file
+        // the whole SFC is scanned (template `:href="route('x')"` is where most live).
+        foreach ($this->extractRouteNameRefs($full) as $ref) {
+            $refs[] = $ref;
         }
 
         return ['defs' => $defs, 'refs' => $refs];
