@@ -417,6 +417,11 @@ try {
                 echo "(not found)\n";
                 exit(1);
             }
+            if (str_ends_with($h['file'] ?? '', '.py')) {
+                $bases = array_merge($h['extends'] !== null ? [$h['extends']] : [], $h['implements']);
+                echo 'bases:      '.(implode(', ', $bases) ?: 'none')."\n";
+                break;
+            }
             echo 'extends:    '.($h['extends'] ?? 'none')."\n";
             echo 'implements: '.(implode(', ', $h['implements']) ?: 'none')."\n";
             echo 'traits:     '.(implode(', ', $h['traits']) ?: 'none')."\n";

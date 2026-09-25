@@ -511,8 +511,39 @@ def build_py_widget(name):
     return PyWidget(name)
 PY;
 
+$pyHierFixture = <<<'PY'
+import abc
+from typing import Generic, TypeVar
+
+T = TypeVar("T")
+
+
+class Base(abc.ABC):
+    pass
+
+
+class LoggingMixin(object):
+    pass
+
+
+class Repo(Generic[T], Base, metaclass=abc.ABCMeta):
+    pass
+
+
+class UserRepo(
+    LoggingMixin,  # mixin first
+    Repo[int],
+):
+    pass
+
+
+class Plain:
+    pass
+PY;
+
 writeFixture($fixtureRoot3, 'widget.go', $goFixture);
 writeFixture($fixtureRoot3, 'widget.py', $pyFixture);
+writeFixture($fixtureRoot3, 'repos.py', $pyHierFixture);
 
 $indexer6 = new SourceIndexer($fixtureRoot3, $dbPath3);
 $indexer6->build();
@@ -574,6 +605,35 @@ check('refs finds the "from collections import OrderedDict" name', count($ordere
 
 $collectionsRefs = $qe6->refs('collections');
 check('refs finds the "from collections import ..." module', count($collectionsRefs) > 0, 'got '.json_encode($collectionsRefs));
+
+// Python class bases → hier/children. First base = extends, the rest = further bases.
+$baseHier = $qe6->hier('Base');
+check('hier: dotted base reduced to its last segment (abc.ABC → ABC)',
+    ($baseHier['extends'] ?? null) === 'ABC' && $baseHier['implements'] === [], 'got '.json_encode($baseHier));
+
+$mixinHier = $qe6->hier('LoggingMixin');
+check('hier: explicit object base is dropped', $mixinHier !== null && $mixinHier['extends'] === null && $mixinHier['implements'] === [],'got '.json_encode($mixinHier));
+
+$repoHier = $qe6->hier('Repo');
+check('hier: generic reduced to its name, metaclass= keyword skipped',
+    ($repoHier['extends'] ?? null) === 'Generic' && $repoHier['implements'] === ['Base'], 'got '.json_encode($repoHier));
+
+$userRepoHier = $qe6->hier('UserRepo');
+check('hier: multi-line header with a comment and a subscripted base',
+    ($userRepoHier['extends'] ?? null) === 'LoggingMixin' && $userRepoHier['implements'] === ['Repo'], 'got '.json_encode($userRepoHier));
+
+$plainHier = $qe6->hier('Plain');
+check('hier: class without bases has no parents', $plainHier !== null && $plainHier['extends'] === null && $plainHier['implements'] === [],
+    'got '.json_encode($plainHier));
+
+$baseChildren = array_column($qe6->children('Base'), 'class');
+check('children finds a subclass that lists the class as a later base', $baseChildren === ['Repo'], 'got '.json_encode($baseChildren));
+
+$repoChildren = array_column($qe6->children('Repo'), 'class');
+check('children finds a subclass that uses a subscripted base (Repo[int])', $repoChildren === ['UserRepo'], 'got '.json_encode($repoChildren));
+
+$baseRefs = array_column($qe6->refs('Base'), 'file');
+check('refs finds a class used as a Python base', in_array('repos.py', $baseRefs, true), 'got '.json_encode($baseRefs));
 
 unset($qe6, $indexer6);
 

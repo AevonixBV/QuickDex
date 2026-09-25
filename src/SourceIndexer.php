@@ -1083,6 +1083,7 @@ final class SourceIndexer
         $refs = [];
         $counts = [];
         $classRanges = [];
+        $hierarchy = [];
 
         // Classes — indentation-delimited body, so its extent is found by scanning
         // forward for the next line whose indentation falls back to <= the class's
@@ -1101,6 +1102,18 @@ final class SourceIndexer
                     'ns' => null,
                 ];
                 $classRanges[] = ['name' => $name, 'start' => $lineNo, 'end' => $endLineNo];
+
+                // Bases → hierarchy: the first base is `extends` (primary in the MRO),
+                // any further bases (mixins) go in `implements`. Each base is also a ref.
+                $bases = $this->parsePythonBases($lines, $i, strlen($m[0]));
+                $hierarchy[$name] = [
+                    'extends'    => $bases[0] ?? null,
+                    'implements' => array_slice($bases, 1),
+                    'traits'     => [],
+                ];
+                foreach ($bases as $base) {
+                    $refs[] = ['symbol' => $base, 'line' => $lineNo];
+                }
             }
         }
         $counts['classes'] = count($classRanges);
@@ -1166,9 +1179,82 @@ final class SourceIndexer
             'ns'        => null,
             'defs'      => $defs,
             'refs'      => $refs,
-            'hierarchy' => [],
+            'hierarchy' => $hierarchy,
             'summary'   => $summary,
         ];
+    }
+
+    /**
+     * Base class names from a Python class header starting at $lines[$startIndex],
+     * $offset bytes past `class Name`. The parenthesised list may span lines.
+     * Keyword args (metaclass=…), *args/**kwargs and `object` are dropped; generics
+     * are reduced to their name (Generic[T] → Generic) and dotted names to their
+     * last segment (models.Model → Model), matching how defs store class names.
+     *
+     * @return list<string>
+     */
+    private function parsePythonBases(array $lines, int $startIndex, int $offset): array
+    {
+        $text = substr($lines[$startIndex], $offset);
+        for ($j = $startIndex + 1, $n = count($lines); $j < $n && $j <= $startIndex + 30; $j++) {
+            $text .= "\n".$lines[$j];
+        }
+
+        $text = ltrim($text);
+        if (! str_starts_with($text, '(')) {
+            return [];
+        }
+
+        // Split the parenthesised list on top-level commas.
+        $args = [];
+        $current = '';
+        $depth = 0;
+        $len = strlen($text);
+        for ($k = 0; $k < $len; $k++) {
+            $c = $text[$k];
+            if ($c === '#') {
+                // Comment inside a multi-line header — skip to end of line.
+                $nl = strpos($text, "\n", $k);
+                $k = $nl === false ? $len : $nl;
+                continue;
+            }
+            if ($c === '(' || $c === '[' || $c === '{') {
+                $depth++;
+                if ($depth === 1) {
+                    continue;
+                }
+            } elseif ($c === ')' || $c === ']' || $c === '}') {
+                $depth--;
+                if ($depth === 0) {
+                    $args[] = $current;
+                    break;
+                }
+            } elseif ($c === ',' && $depth === 1) {
+                $args[] = $current;
+                $current = '';
+                continue;
+            }
+            $current .= $c;
+        }
+
+        $bases = [];
+        foreach ($args as $arg) {
+            $arg = trim($arg);
+            if ($arg === '' || str_starts_with($arg, '*') || preg_match('/^[A-Za-z_]\w*\s*=(?!=)/', $arg)) {
+                continue;
+            }
+            $arg = preg_replace('/\[.*$/s', '', $arg);
+            if (! preg_match('/^[A-Za-z_][\w.]*$/', $arg)) {
+                continue;
+            }
+            $parts = explode('.', $arg);
+            $name = end($parts);
+            if ($name !== 'object' && ! in_array($name, $bases, true)) {
+                $bases[] = $name;
+            }
+        }
+
+        return $bases;
     }
 
     /**

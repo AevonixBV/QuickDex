@@ -105,7 +105,7 @@ quickdex <command> [args]
 | `body <Name> [--limit N]` | Print the actual source of every matching def — no separate file read needed |
 | `refs <Name>` | Which files (and lines) reference this symbol? A **usage** graph, not just imports: captures `new X`, `X::`, `extends`/`implements`, and type hints — including a sibling class in the **same namespace** that needs no `use`. Falls back to path-suffix match (`pages/Calendar` finds `@/pages/Calendar`) |
 | `files [--type php\|vue\|ts\|js] [--ns Namespace] [--path prefix]` | List files with optional filters |
-| `hier <ClassName>` | Show extends / implements / traits for a class |
+| `hier <ClassName>` | Show extends / implements / traits for a class (Python: bases) |
 | `children <ClassName>` | Find all classes that extend a class |
 | `syms <path/to/file>` | List all symbols defined in a file |
 | `deps <path/to/file>` | List all imports/use statements in a file |
@@ -195,7 +195,7 @@ QUICKDEX_DB=/path/to/quickdex.db quickdex def User
 | Exports | — | yes | yes | — | — | — |
 | Sections | — | — | — | `@section(...)` | — | — |
 | Imports / refs | `use` statements **+ inline usages** (`new X`, `X::`, `extends`/`implements`, type hints — incl. same-namespace siblings, via the native tokenizer so comments/strings are skipped) | `import` | `import` | `@include`/`@extends`/`@component`/`<x-component>` | `import` (single-line + grouped block) | `import` / `from ... import ...` |
-| Class hierarchy | extends + implements + traits | — | — | — | — | — |
+| Class hierarchy | extends + implements + traits | — | — | — | — | bases (incl. mixins) |
 | Migrations | `Schema::create/table/dropIfExists/drop` indexed as `kind=table:<op>`, `name=<table>` — `def <table>` finds every migration touching it | — | — | — |
 | Props / emits | — | `defineProps` (`kind=prop`) and `defineEmits` (`kind=emit`), `ns=<component>`; TS generic, interface-backed, object and array forms | — | — |
 | Template usage | — | every child component tag in `<template>` (`<StatTile>`, `<app-button>` → `AppButton`) is a ref | — | — |

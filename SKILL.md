@@ -42,7 +42,7 @@ Fallback: `php QuickDex/bin/query.php <command> [args]`
 | `files --type vue` | List all Vue files (also: php, ts, js, blade) |
 | `files --ns "App\Models"` | List all files under a namespace prefix (PHP only) |
 | `files --path "app/Http"` | List all files under a path prefix (any language) |
-| `hier <ClassName>` | extends / implements / traits for a class |
+| `hier <ClassName>` | extends / implements / traits for a class (Python: bases) |
 | `children <ClassName>` | All classes that extend this class |
 | `syms <path/to/file.php>` | All symbols defined in one file |
 | `deps <path/to/file.php>` | All imports/use statements in one file |

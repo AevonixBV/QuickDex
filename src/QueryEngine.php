@@ -95,20 +95,29 @@ final class QueryEngine
             return null;
         }
 
+        $file = $this->db->prepare("SELECT file FROM defs WHERE kind = 'class' AND LOWER(name) = LOWER(?) LIMIT 1");
+        $file->execute([$class]);
+
         return [
             'extends'    => $row['extends'],
             'implements' => json_decode($row['implements'], true) ?? [],
             'traits'     => json_decode($row['traits'], true) ?? [],
+            'file'       => $file->fetchColumn() ?: null,
         ];
     }
 
-    /** All classes that extend a given class. */
+    /**
+     * All classes that extend a given class. For Python, a class listing it as a
+     * later base (a mixin, stored in `implements`) counts too.
+     */
     public function children(string $class): array
     {
         $stmt = $this->db->prepare(
-            'SELECT h.class, d.file, d.line FROM hierarchy h LEFT JOIN defs d ON LOWER(d.name) = LOWER(h.class) AND d.kind = \'class\' WHERE LOWER(h.extends) = LOWER(?) ORDER BY h.class'
+            'SELECT h.class, d.file, d.line FROM hierarchy h LEFT JOIN defs d ON LOWER(d.name) = LOWER(h.class) AND d.kind = \'class\'
+             WHERE LOWER(h.extends) = LOWER(?) OR (d.file LIKE \'%.py\' AND h.implements LIKE ?)
+             ORDER BY h.class'
         );
-        $stmt->execute([$class]);
+        $stmt->execute([$class, '%"'.$class.'"%']);
 
         return $stmt->fetchAll(\PDO::FETCH_ASSOC);
     }
