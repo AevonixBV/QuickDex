@@ -686,7 +686,7 @@ try {
             $exts      = $extArg !== '' ? array_map('trim', explode(',', $extArg)) : ['php', 'vue', 'js', 'ts', 'blade', 'yml', 'yaml', 'go', 'py'];
             if ($patterns === []) {
                 echo "Usage: quickdex grep <pattern1> [pattern2 ...] [--dir a,b] [--ext php,vue,blade,...] [--limit N] [-l|--files-only] [--all]\n";
-                echo "Multiple patterns match with OR semantics — use separate args, not '|' (crashes the Windows .bat wrapper; also grep never supported regex).\n";
+                echo "Multiple patterns match with OR semantics — prefer separate args. 'a|b' also works, but quote it: an unquoted | is a pipe to cmd.exe on Windows. Not regex.\n";
                 exit(1);
             }
 

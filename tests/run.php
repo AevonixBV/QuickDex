@@ -458,6 +458,17 @@ check('grep --limit caps returned rows', count($qe5->grep(['namespace App'], [],
 check('grep excludes dist/ build artifacts', count($qe5->grep(['compiled'], [], ['js'], 200, false, false)) === 0,
     'grep found a match inside dist/');
 
+// grep 'a|b' / 'a\|b' — agents' rg habit; used to silently return (no matches).
+check('splitAlternation splits a lone | and \\| into OR patterns',
+    QueryEngine::splitAlternation(['foo|bar', 'baz\|qux']) === ['foo', 'bar', 'baz', 'qux'],
+    json_encode(QueryEngine::splitAlternation(['foo|bar', 'baz\|qux'])));
+check('splitAlternation keeps || and pipe-only patterns literal',
+    QueryEngine::splitAlternation(['$a || $b', '|', '|a|']) === ['$a || $b', '|', 'a'],
+    json_encode(QueryEngine::splitAlternation(['$a || $b', '|', '|a|'])));
+check('grep treats "a|b" as OR of the two literals',
+    count($qe5->grep(['namespace App|no-such-literal-xyz'], [], ['php'], 200, false, false)) === 3,
+    'pipe-joined pattern did not match');
+
 unset($qe5, $indexer5);
 
 // ── Pass 6: Go and Python indexing (isolated fixture) ───────────────────────

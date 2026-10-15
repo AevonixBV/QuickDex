@@ -602,6 +602,30 @@ final class QueryEngine
     }
 
     /**
+     * Agents reach for `grep 'foo|bar'` / `'foo\|bar'` out of rg/GNU-grep habit. Against a
+     * literal substring match that silently returned "(no matches)", so they gave up on
+     * QuickDex and fell back to rg. Treat a lone `|` (optionally backslash-escaped) as an
+     * OR separator instead. `||` is left alone so `$a || $b` still searches literally, and
+     * a pattern that is nothing but pipes stays as-is.
+     *
+     * @param  list<string>  $patterns
+     * @return list<string>
+     */
+    public static function splitAlternation(array $patterns): array
+    {
+        $out = [];
+        foreach ($patterns as $pattern) {
+            $parts = array_values(array_filter(
+                preg_split('/(?<!\|)\\\\?\|(?!\|)/', $pattern) ?: [],
+                fn (string $p): bool => $p !== '',
+            ));
+            array_push($out, ...($parts === [] ? [$pattern] : $parts));
+        }
+
+        return array_values(array_unique($out));
+    }
+
+    /**
      * Scan files under $dir (relative to project root, default = root) for a literal
      * substring, restricted to $extensions. Same exclusion rules as the indexer.
      * Use for content search QuickDex's symbol index can't answer (Blade markup,
@@ -609,14 +633,14 @@ final class QueryEngine
      */
     /**
      * @param  list<string>  $patterns  matched with OR semantics — a line matching ANY pattern is
-     *                                  returned once. Pass multiple patterns instead of `\|`/regex
-     *                                  alternation syntax, which this method never supported (it's
-     *                                  a literal case-insensitive substring match, not regex) and
-     *                                  which crashes the .bat wrapper on Windows anyway (`|` and
-     *                                  `()` are cmd.exe metacharacters — see grep case in query.php).
+     *                                  returned once. Prefer separate args; a single `|` or `\|`
+     *                                  inside one pattern is also accepted as alternation (see
+     *                                  splitAlternation()). Everything else is still a literal
+     *                                  case-insensitive substring match, not regex.
      */
     public function grep(array $patterns, array $dirs = [], array $extensions = ['php', 'vue', 'js', 'ts', 'blade', 'yml', 'yaml', 'go', 'py'], int $limit = 200, bool $filesOnly = false, bool $includeNoisy = false): array
     {
+        $patterns = self::splitAlternation($patterns);
         $root = $this->rootPath();
         $searchRoots = $dirs === []
             ? [$root]

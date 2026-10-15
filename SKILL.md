@@ -113,9 +113,9 @@ quickdex uses BelongsToTenant
 # Verify multiple fixes were applied — no grep, no context lines
 quickdex patch BillingController "loadCount" "translatedFormat" "users_count"
 
-# grep with multiple patterns (OR) — use separate args, not "foo\|bar" regex syntax
-# (grep is a literal substring match, never regex; "|" also crashes the Windows
-# .bat wrapper since it's a cmd.exe metacharacter, regardless of grep semantics)
+# grep with multiple patterns (OR) — separate args preferred; a quoted "foo|bar" or
+# "foo\|bar" is split into the same OR list. Still a literal substring match, never
+# regex. Don't fall back to rg just for alternation.
 quickdex grep "SEPA" "iDEAL" --dir app --ext php
 
 # comma-separated dirs, list matching files only, or cap the row count

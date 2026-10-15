@@ -117,7 +117,7 @@ quickdex <command> [args]
 | `tests <Class>` | Tests for a class: `<Class>Test` first, then every file under `tests/` that references it |
 | `ziggy-check [-v]` | Lint every Vue page: `route()` calls vs the Ziggy groups the page is served with. Exit 2 on violations. Calls guarded by `v-if` on the user / an `isAuthed` ternary are counted, not flagged |
 | `overview` | Repo shape on one screen: files and lines per area, routes, pages, components, tests, migrations |
-| `grep <p1> [p2 ...] [--dir a,b] [--ext php,vue,...] [--limit N] [-l\|--files-only] [--all]` | Scan files for a literal string (case-insensitive substring, not regex). Multiple patterns = OR (separate args, not `\|`/regex — crashes the Windows `.bat`). `--dir` accepts a comma-separated list and **errors** on an invalid path (not a silent `(no matches)`). `--limit` caps rows (default 200); `-l`/`--files-only` lists matching files once; lockfiles + `*.min.*` are excluded unless `--all` |
+| `grep <p1> [p2 ...] [--dir a,b] [--ext php,vue,...] [--limit N] [-l\|--files-only] [--all]` | Scan files for a literal string (case-insensitive substring, not regex). Multiple patterns = OR: separate args, or one quoted arg with a lone `\|` / `\\|` separator (`\|\|` stays literal). `--dir` accepts a comma-separated list and **errors** on an invalid path (not a silent `(no matches)`). `--limit` caps rows (default 200); `-l`/`--files-only` lists matching files once; lockfiles + `*.min.*` are excluded unless `--all` |
 | `index [root] [db] [--force]` | Build or rebuild the index (aliases: `build`, `reindex`, `rebuild`) |
 | `meta` | Show index metadata (timestamp, file count, last build mode) |
 
