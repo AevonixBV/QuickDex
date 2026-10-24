@@ -51,17 +51,13 @@ cd /path/to/myproject
 quickdex index
 ```
 
-This writes `quickdex.db` into the project root. Add it to `.gitignore`:
+This writes `quickdex.db` into the project root. It's a generated file, so add it to `.gitignore`:
 
 ```
 /quickdex.db
 ```
 
-Rebuild after significant changes:
-
-```sh
-quickdex index
-```
+You rarely need to rebuild by hand: queries notice a stale index and refresh it (see [Build the index](#1-build-the-index)).
 
 ### How it works across projects
 
@@ -77,7 +73,7 @@ From the project root:
 quickdex index
 ```
 
-Scans all `.php`, `.vue`, `.js`, `.ts` files (excluding `vendor`, `node_modules`, `.git`, `.claude`, `storage`, `tmp`, `.idea`, `.vscode`, `coverage`, `dist`, `.output`, and the compiled paths `bootstrap/cache`, `bootstrap/ssr`, `public/build`) and writes `quickdex.db` to the project root. The `bootstrap/ssr` / `public/build` / `dist` exclusions specifically matter for Vite/Inertia SSR projects — without them, compiled output gets indexed as if it were hand-written source, burying real symbols under thousands of lines of minified/bundled noise. Note these are the **specific** compiled paths, not bare `build`/`ssr` segments, so a legitimate `bootstrap/app.php` stays indexed and grep can still find it.
+Scans all `.php`, `.inc`, `.vue`, `.js`, `.ts`, `.go`, `.py` files (excluding `vendor`, `node_modules`, `.git`, `.claude`, `.codex`, `storage`, `tmp`, `.idea`, `.vscode`, `coverage`, `dist`, `.output`, and the compiled paths `bootstrap/cache`, `bootstrap/ssr`, `public/build`) and writes `quickdex.db` to the project root. The `bootstrap/ssr` / `public/build` / `dist` exclusions specifically matter for Vite/Inertia SSR projects — without them, compiled output gets indexed as if it were hand-written source, burying real symbols under thousands of lines of minified/bundled noise. Note these are the **specific** compiled paths, not bare `build`/`ssr` segments, so a legitimate `bootstrap/app.php` stays indexed and grep can still find it.
 
 Custom root or output path:
 
@@ -102,9 +98,9 @@ quickdex <command> [args]
 | Command | Description |
 |---|---|
 | `def <Name>` | Where is a symbol defined? Namespace prefix stripped automatically (`App\Models\User` → `User`). Framework-generated defs (Wayfinder `resources/js/{actions,routes}`) sort last and are tagged `·gen` |
-| `body <Name> [--limit N]` | Print the actual source of every matching def — no separate file read needed |
+| `body <Name> [--limit N]` | Print the actual source of every matching def — no separate file read needed. Capped at 10 matches / 400 lines by default |
 | `refs <Name>` | Which files (and lines) reference this symbol? A **usage** graph, not just imports: captures `new X`, `X::`, `extends`/`implements`, and type hints — including a sibling class in the **same namespace** that needs no `use`. Falls back to path-suffix match (`pages/Calendar` finds `@/pages/Calendar`) |
-| `files [--type php\|vue\|ts\|js] [--ns Namespace] [--path prefix]` | List files with optional filters |
+| `files [--type php\|blade\|vue\|ts\|js\|go\|py] [--ns Namespace] [--path prefix]` | List files with optional filters |
 | `hier <ClassName>` | Show extends / implements / traits for a class (Python: bases) |
 | `children <ClassName>` | Find all classes that extend a class |
 | `syms <path/to/file>` | List all symbols defined in a file |
@@ -196,12 +192,12 @@ QUICKDEX_DB=/path/to/quickdex.db quickdex def User
 | Sections | — | — | — | `@section(...)` | — | — |
 | Imports / refs | `use` statements **+ inline usages** (`new X`, `X::`, `extends`/`implements`, type hints — incl. same-namespace siblings, via the native tokenizer so comments/strings are skipped) | `import` | `import` | `@include`/`@extends`/`@component`/`<x-component>` | `import` (single-line + grouped block) | `import` / `from ... import ...` |
 | Class hierarchy | extends + implements + traits | — | — | — | — | bases (incl. mixins) |
-| Migrations | `Schema::create/table/dropIfExists/drop` indexed as `kind=table:<op>`, `name=<table>` — `def <table>` finds every migration touching it | — | — | — |
-| Props / emits | — | `defineProps` (`kind=prop`) and `defineEmits` (`kind=emit`), `ns=<component>`; TS generic, interface-backed, object and array forms | — | — |
-| Template usage | — | every child component tag in `<template>` (`<StatTile>`, `<app-button>` → `AppButton`) is a ref | — | — |
-| Route names | `route('x')` / `to_route('x')` literals are refs on `x` | `route('x')` in script and template | same | — |
-| Inertia pages | `Inertia::render('X')` / `inertia('X')` → `pages` table with the owning `Class@method` | — | — | — |
-| Routes | `php artisan route:list --json` → `routes` table (needs `./artisan`; `QUICKDEX_NO_ARTISAN=1` skips); Ziggy groups from `config/ziggy.php` | — | — | — |
+| Migrations | `Schema::create/table/dropIfExists/drop` indexed as `kind=table:<op>`, `name=<table>` — `def <table>` finds every migration touching it | — | — | — | — | — |
+| Props / emits | — | `defineProps` (`kind=prop`) and `defineEmits` (`kind=emit`), `ns=<component>`; TS generic, interface-backed, object and array forms | — | — | — | — |
+| Template usage | — | every child component tag in `<template>` (`<StatTile>`, `<app-button>` → `AppButton`) is a ref | — | — | — | — |
+| Route names | `route('x')` / `to_route('x')` literals are refs on `x` | `route('x')` in script and template | same | — | — | — |
+| Inertia pages | `Inertia::render('X')` / `inertia('X')` → `pages` table with the owning `Class@method` | — | — | — | — | — |
+| Routes | `php artisan route:list --json` → `routes` table (needs `./artisan`; `QUICKDEX_NO_ARTISAN=1` skips); Ziggy groups from `config/ziggy.php` | — | — | — | — | — |
 
 JS/TS indexing intentionally skips inner-scope variables — only exported and top-level symbols are indexed to avoid noise. `.blade.php` files are indexed as `type=blade` — `refs x-email.layout` finds every view using that component.
 
@@ -229,14 +225,6 @@ The database path is resolved by walking up from the current directory (like `gi
 there is **no** repo-relative fallback, so a query outside any indexed project fails
 loudly rather than silently serving another project's index.
 
-## Gitignore
-
-Add to your `.gitignore` — the database is a generated artifact:
-
-```
-/quickdex.db
-```
-
 ## Project structure
 
 ```
@@ -250,55 +238,54 @@ QuickDex/
   src/
     SourceIndexer.php   Walks source files and writes to SQLite
     QueryEngine.php     Reads from SQLite and returns results
+  tests/
+    run.php             Test runner (php tests/run.php)
   SKILL.md           Claude Code agent skill definition
   README.md          This file
 ```
 
 ## Claude Code integration
 
-### 1. Install the skill
-
-Copy `SKILL.md` to `.claude/skills/read-reducer/SKILL.md` in each project:
+### 1. Install the skill (once, for all projects)
 
 ```bash
-mkdir -p .claude/skills/read-reducer
-cp /path/to/QuickDex/SKILL.md .claude/skills/read-reducer/SKILL.md
+mkdir -p ~/.claude/skills/quickdex
+cp /path/to/QuickDex/SKILL.md ~/.claude/skills/quickdex/SKILL.md
 ```
 
-### 2. Add the QuickDex rule to AGENTS.md
+The folder name must match the skill's `name: quickdex`. To scope it to one project instead, use `.claude/skills/quickdex/` inside that project.
 
-Add the following block to your project's `AGENTS.md` (or `CLAUDE.md`):
+### 2. Add the QuickDex rule to AGENTS.md / CLAUDE.md
+
+The skill loads on demand. This short block keeps the habit in every session:
 
 ```
-Always use QuickDex before reading any file. Run `quickdex <command>` to locate symbols, find usages, and identify relevant files. Never search or read files blindly when the index can answer first.
-
-Common lookups:
-- Symbol location: `quickdex def <Name>`
+Query QuickDex before Read/grep/ls — it returns exact lines, not whole files.
+- First look at a repo: `quickdex overview`
+- Show a class/method: `quickdex body <Name>` (not a full-file Read)
+- Where defined / fuzzy: `quickdex def <Name>` / `quickdex search <part>`
 - Who uses it: `quickdex refs <Name>`
-- File list: `quickdex files --type vue` or `--ns "App\Models"`
-- Hierarchy: `quickdex hier <ClassName>`
-- Fuzzy search: `quickdex search <pattern>`
+- Does a file contain X: `quickdex patch <Class|path> "x" "y"`
+- Text search: `quickdex grep "a" "b" --dir app` (literal, not regex)
+- Laravel: `quickdex route <name>`, `quickdex page <Name>`, `quickdex tests <Class>`
+"Not found" is trustworthy — the index self-refreshes when stale. On Windows run it from PowerShell, not Bash.
 ```
 
 ### 3. Allow `quickdex` in Claude Code permissions
 
-Add to your global `~/.claude/settings.json`:
+In `~/.claude/settings.json`:
 
 ```json
-"Bash(quickdex *)",
-"PowerShell(quickdex *)"
+{
+  "permissions": {
+    "allow": [
+      "Bash(quickdex *)",
+      "PowerShell(quickdex *)"
+    ]
+  }
+}
 ```
 
-### 4. Build the index and gitignore the db
+### 4. Index each project
 
-```bash
-cd /path/to/myproject
-quickdex index
-echo "/quickdex.db" >> .gitignore
-```
-
-Rebuild after significant repository changes:
-
-```bash
-quickdex index
-```
+Run `quickdex index` in the project root and gitignore `/quickdex.db` (see [Installation](#3-build-a-database-for-each-project)).
