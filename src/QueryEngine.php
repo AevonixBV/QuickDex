@@ -485,7 +485,7 @@ final class QueryEngine
                 'line' => (int) $r['line'],
                 'ziggy' => $r['ziggy'],
                 'defined' => (bool) $r['defined'],
-                'guard' => $this->guardAt($lines, (int) $r['line']),
+                'guard' => $this->guardAt($lines, (int) $r['line'], (string) $r['name']),
             ];
         }
 
@@ -494,25 +494,29 @@ final class QueryEngine
 
     /**
      * How a route() call at $line is protected from the Ziggy audience problem:
-     * `comment` (the call sits in a comment), `guarded` (an auth check — `v-if` on the
-     * user, an `isAuthed ?:` ternary, `$page.props.auth.user` — appears on the line or
-     * within the 25 lines above it, i.e. the enclosing element or expression), or `none`.
+     * `comment` (the call sits in a comment), `guarded`, or `none`. Guarded means one of:
+     *  - a `v-if`/`v-show`/`v-else-if` testing the user on the call line or within the
+     *    25 lines above (the enclosing element);
+     *  - `ziggy` in that window (the page ships its own route table with its props, the
+     *    documented hand-off for pages a guest reaches before login);
+     *  - the call sits in the signed-in (`?`) branch of an auth ternary, on one line or
+     *    split over two ({@see self::isInSignedInBranch()}).
+     * A declaration such as `const isAuthed = computed(...)` is never a guard, however
+     * close it sits.
      *
      * @param  list<string>  $lines
      */
-    private function guardAt(array $lines, int $line): string
+    private function guardAt(array $lines, int $line, string $name = ''): string
     {
         $text = trim($lines[$line - 1] ?? '');
         if (preg_match('#^(//|/\*|\*|<!--)#', $text)) {
             return 'comment';
         }
 
-        // A guard is an auth test on the call line itself (`isAuthed ? route(..) : ..`),
-        // or a `v-if`/`v-show`/`v-else-if` on the user within the 25 lines above (the
-        // enclosing element). A declaration such as `const isAuthed = computed(...)`
-        // is not a guard, however close it sits. `ziggy` in the window = the page ships
-        // its own route table with the props (the documented hand-off pattern for
-        // pages a guest reaches before login).
+        if ($this->isInSignedInBranch($lines, $line, $name)) {
+            return 'guarded';
+        }
+
         $auth = '/auth\??\.user|isAuthed|isAuthenticated|props\.auth\b|auth\.check\(\)/i';
         for ($i = $line - 1; $i >= max(0, $line - 26); $i--) {
             $candidate = $lines[$i] ?? '';
@@ -522,15 +526,87 @@ final class QueryEngine
             if (preg_match('/\bziggy\b/i', $candidate)) {
                 return 'guarded';
             }
-            if (! preg_match($auth, $candidate)) {
-                continue;
-            }
-            if ($i === $line - 1 || preg_match('/\bv-(if|show|else-if)\s*=/', $candidate)) {
+            if (preg_match($auth, $candidate) && preg_match('/\bv-(if|show|else-if)\s*=/', $candidate)) {
                 return 'guarded';
             }
         }
 
         return 'none';
+    }
+
+    /**
+     * True when the route() call runs only for a signed-in visitor because it sits in the
+     * `?` branch of a ternary whose whole condition is an auth test:
+     *
+     *     :href="isAuthed ? route('sites.index') : route('register')"    <- sites.index only
+     *
+     *     link: isAuthed.value                                            <- Prettier's split
+     *         ? { href: route('sites.index') }
+     *         : { href: route('register') },
+     *
+     * The text judged is everything before this call on its line, prefixed with the nearest
+     * code line above when the call line opens with `?`/`:` or that line ends in `?`.
+     * Deliberately strict, because a wrong `guarded` hides a page that dies at render:
+     *  - the auth test must stand alone after `:`, `=`, `(`, `,`, `{`, a quote, `?` or
+     *    `return`, so `!isAuthed`, `! $page.props.auth.user`, `foo || isAuthed`,
+     *    `x === isAuthed` and `user?.isAuthed` never count;
+     *  - it must be followed by a plain `?`, not `??` (runs when the user is null) or `?.`;
+     *  - nothing between that `?` and the call may be a `:` outside brackets and strings,
+     *    which would put the call in the guest branch (`isAuthed ? null : route('x')`).
+     * Shapes it misses (an object opened on the `?` line with the call further down)
+     * report `none`: a false alarm to read, never a hidden one. Case-sensitive, like JS.
+     *
+     * @param  list<string>  $lines
+     */
+    private function isInSignedInBranch(array $lines, int $line, string $name): bool
+    {
+        $callLine = $lines[$line - 1] ?? '';
+        $offset = null;
+        if ($name !== '' && preg_match('/\broute\(\s*[\'"]'.preg_quote($name, '/').'[\'"]/', $callLine, $m, PREG_OFFSET_CAPTURE)) {
+            $offset = $m[0][1];
+        } elseif (preg_match('/\broute\(/', $callLine, $m, PREG_OFFSET_CAPTURE)) {
+            $offset = $m[0][1];
+        }
+        if ($offset === null) {
+            return false;
+        }
+        $context = substr($callLine, 0, $offset);
+
+        $previous = null;
+        for ($i = $line - 2; $i >= 0; $i--) {
+            $candidate = trim($lines[$i] ?? '');
+            if ($candidate === '' || preg_match('#^(//|/\*|\*|<!--)#', $candidate)) {
+                continue;
+            }
+            $previous = $candidate;
+            break;
+        }
+        $opensWithBranch = preg_match('/^\s*[?:]/', $context) === 1;
+        if ($previous !== null && ($opensWithBranch || str_ends_with($previous, '?'))) {
+            $context = $previous.' '.ltrim($context);
+        }
+
+        $operand = '(?:(?:\$page|usePage\(\)|page)\.props\.auth\??\.user|props\.auth\??\.user|auth\??\.user|isAuthed(?:\.value)?|isAuthenticated(?:\.value)?|auth\.check\(\))';
+        $anchor = '(?:^|(?<![=!<>])[:=]|[(,{"\'`?]|\breturn)';
+        if (! preg_match_all('/'.$anchor.'\s*'.$operand.'\s*\?(?![?.])/', $context, $tests, PREG_OFFSET_CAPTURE)) {
+            return false;
+        }
+        $last = end($tests[0]);
+        $branch = substr($context, $last[1] + strlen($last[0]));
+
+        $branch = (string) preg_replace('/\'(?:\\\\.|[^\'\\\\])*\'|"(?:\\\\.|[^"\\\\])*"|`(?:\\\\.|[^`\\\\])*`/', '', $branch);
+        $depth = 0;
+        foreach (str_split($branch) as $char) {
+            if (str_contains('([{', $char)) {
+                $depth++;
+            } elseif (str_contains(')]}', $char)) {
+                $depth--;
+            } elseif ($char === ':' && $depth <= 0) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /** @param list<string> $dirs  @return list<string> those that exist under the project root */

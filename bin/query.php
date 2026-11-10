@@ -656,7 +656,7 @@ try {
             } elseif ($z['unattributed'] !== []) {
                 echo "(add -v to list unattributed pages)\n";
             }
-            echo "Note: 'guarded' = an auth check (v-if on the user, isAuthed ternary) within 25 lines above the call — heuristic, read the line before trusting it. Layouts/components are not linted, only pages.\n";
+            echo "Note: 'guarded' = a v-if/v-show on the user within 25 lines above the call, or the call in the signed-in (?) branch of an isAuthed / auth.user ternary (one line or split over two) — heuristic, read the line before trusting it. Layouts/components are not linted, only pages.\n";
             exit($z['violations'] === [] ? 0 : 2);
 
         case 'overview':
