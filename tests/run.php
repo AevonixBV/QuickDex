@@ -745,6 +745,54 @@ import StatTile from '@/Components/StatTile.vue'
 import FrontLayout from '@/Layouts/FrontLayout.vue'
 
 const isAuthed = computed(() => !!usePage().props.auth.user)
+
+const card = {
+    link: isAuthed.value
+        ? { href: route('sites.index'), label: 'Open sites' }
+        : { href: route('register'), label: 'Sign up' },
+}
+
+const wrongBranch = {
+    link: isAuthed.value
+        ? { href: route('register') }
+        : { href: route('admin.users.index') },
+}
+
+const negated = {
+    link: !isAuthed.value
+        ? { href: route('admin.users.index') }
+        : { href: route('register') },
+}
+
+const negatedProps = {
+    link: !$page.props.auth.user
+        ? { href: route('admin.users.index') }
+        : null,
+}
+
+const negatedSpaced = {
+    link: ! isAuthed.value
+        ? { href: route('admin.users.index') }
+        : null,
+}
+
+const orChain = {
+    link: foo || isAuthed.value
+        ? { href: route('admin.users.index') }
+        : null,
+}
+
+const nullish = {
+    href: page.props.auth.user
+        ?? route('admin.users.index'),
+}
+
+const commentedCondition = {
+    // isAuthed.value
+        ? route('admin.users.index') : null,
+}
+
+const sameLineElse = isAuthed.value ? route('register') : route('admin.users.index')
 </script>
 
 <template>
@@ -825,7 +873,7 @@ check('closure route resolves to routes/web.php:line and its render call', ($abo
 
 check('route() string literals are refs (PHP and Vue callers)',
     count(array_filter($qe6->refs('sites.index'), static fn (array $r): bool => str_ends_with($r['file'], 'SiteController.php'))) === 1
-    && count(array_filter($qe6->refs('sites.index'), static fn (array $r): bool => str_ends_with($r['file'], 'Features.vue'))) === 1
+    && count(array_filter($qe6->refs('sites.index'), static fn (array $r): bool => str_ends_with($r['file'], 'Features.vue'))) === 2
     && count(array_filter($qe6->refs('sites.index'), static fn (array $r): bool => str_ends_with($r['file'], 'SitesPageTest.php'))) === 1,
     json_encode($qe6->refs('sites.index')));
 
@@ -838,14 +886,19 @@ check('page lists template components incl. kebab-case tags as PascalCase',
     json_encode($featuresPage['components']));
 $adminCall = array_values(array_filter($featuresPage['route_calls'], static fn (array $c): bool => $c['name'] === 'admin.users.index'))[0] ?? null;
 check('page flags an admin route called from a guest page', $adminCall !== null && $adminCall['ziggy'] === 'admin' && $adminCall['guard'] === 'none', json_encode($adminCall));
-$sitesCall = array_values(array_filter($featuresPage['route_calls'], static fn (array $c): bool => $c['name'] === 'sites.index'))[0] ?? null;
-check('page recognises an isAuthed ternary as a guard', $sitesCall !== null && $sitesCall['guard'] === 'guarded', json_encode($sitesCall));
+$sitesCalls = array_values(array_filter($featuresPage['route_calls'], static fn (array $c): bool => $c['name'] === 'sites.index'));
+$sitesCall = $sitesCalls[0] ?? null;
+check('page recognises an isAuthed ternary as a guard', count($sitesCalls) === 2 && $sitesCalls[0]['guard'] === 'guarded' && $sitesCalls[1]['guard'] === 'guarded', json_encode($sitesCalls));
+$adminCalls = array_values(array_filter($featuresPage['route_calls'], static fn (array $c): bool => $c['name'] === 'admin.users.index'));
+check('an auth ternary guards only its signed-in branch: not the : branch, a negated or chained test, ??, or a commented condition',
+    count($adminCalls) === 9 && array_unique(array_column($adminCalls, 'guard')) === ['none'],
+    json_encode($adminCalls));
 
 check('page accepts a Vue path too', $qe6->page('resources/js/Pages/Sites/Index.vue')['routes'][0]['name'] === 'sites.index');
 
 $z = $qe6->ziggyCheck();
 check('ziggy-check reports exactly the unguarded cross-audience call',
-    count($z['violations']) === 1 && $z['violations'][0]['route'] === 'admin.users.index' && $z['guarded'] === 1,
+    count($z['violations']) === 9 && array_unique(array_column($z['violations'], 'route')) === ['admin.users.index'] && $z['guarded'] === 2,
     json_encode($z));
 
 $tileSyms = $qe6->fileSymbols('resources/js/Components/StatTile.vue');
